@@ -41,6 +41,8 @@ func migrate(db *sql.DB) error {
 			kind TEXT NOT NULL,
 			line INTEGER NOT NULL,
 			file_path TEXT NOT NULL,
+			delegate_to TEXT NOT NULL DEFAULT '',
+			delegate_as TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
 		);
 
@@ -86,14 +88,14 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO definitions (module, function, kind, line, file_path) VALUES (?, ?, ?, ?, ?)")
+	stmt, err := tx.Prepare("INSERT INTO definitions (module, function, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, d := range defs {
-		_, err := stmt.Exec(d.Module, d.Function, d.Kind, d.Line, d.FilePath)
+		_, err := stmt.Exec(d.Module, d.Function, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs)
 		if err != nil {
 			return err
 		}
@@ -121,14 +123,16 @@ func (s *Store) RemoveFile(path string) error {
 }
 
 type LookupResult struct {
-	FilePath string
-	Line     int
-	Kind     string
+	FilePath   string
+	Line       int
+	Kind       string
+	DelegateTo string
+	DelegateAs string
 }
 
 func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 	rows, err := s.db.Query(
-		"SELECT file_path, line, kind FROM definitions WHERE module = ? AND function = '' AND kind = 'module'",
+		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = '' AND kind IN ('module', 'defprotocol', 'defimpl')",
 		module,
 	)
 	if err != nil {
@@ -139,7 +143,7 @@ func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 	var results []LookupResult
 	for rows.Next() {
 		var r LookupResult
-		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind); err != nil {
+		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.DelegateTo, &r.DelegateAs); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
@@ -149,7 +153,7 @@ func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 
 func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) {
 	rows, err := s.db.Query(
-		"SELECT file_path, line, kind FROM definitions WHERE module = ? AND function = ? AND kind != 'module'",
+		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl')",
 		module, function,
 	)
 	if err != nil {
@@ -160,10 +164,43 @@ func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) 
 	var results []LookupResult
 	for rows.Next() {
 		var r LookupResult
-		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind); err != nil {
+		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.DelegateTo, &r.DelegateAs); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {
+	results, err := s.LookupFunction(module, function)
+	if err != nil {
+		return nil, err
+	}
+
+	// If all results are defdelegates, follow them to the target
+	allDelegates := len(results) > 0
+	for _, r := range results {
+		if r.Kind != "defdelegate" || r.DelegateTo == "" {
+			allDelegates = false
+			break
+		}
+	}
+
+	if allDelegates {
+		targetModule := results[0].DelegateTo
+		targetFunc := function
+		if results[0].DelegateAs != "" {
+			targetFunc = results[0].DelegateAs
+		}
+		targetResults, err := s.LookupFunction(targetModule, targetFunc)
+		if err != nil {
+			return nil, err
+		}
+		if len(targetResults) > 0 {
+			return targetResults, nil
+		}
+	}
+
+	return results, nil
 }

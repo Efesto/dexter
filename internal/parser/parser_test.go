@@ -387,3 +387,315 @@ end
 	}
 }
 
+func TestParseFile_Defdelegate(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Accounts do
+  defdelegate fetch(id), to: MyApp.Repo
+  defdelegate create(attrs), to: MyApp.Accounts.Create
+  defdelegate update(user, attrs), to: MyApp.Accounts.Update
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]bool{}
+	for _, d := range defs {
+		if d.Kind == "defdelegate" {
+			funcs[d.Function] = true
+			if d.Module != "MyApp.Accounts" {
+				t.Errorf("%s should belong to MyApp.Accounts, got %s", d.Function, d.Module)
+			}
+		}
+	}
+
+	for _, name := range []string{"fetch", "create", "update"} {
+		if !funcs[name] {
+			t.Errorf("missing defdelegate %s", name)
+		}
+	}
+}
+
+func TestParseFile_DefdelegateTo(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Accounts do
+  defdelegate fetch(id), to: MyApp.Repo
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "fetch" {
+			if d.DelegateTo != "MyApp.Repo" {
+				t.Errorf("expected DelegateTo MyApp.Repo, got %q", d.DelegateTo)
+			}
+			return
+		}
+	}
+	t.Error("missing defdelegate fetch")
+}
+
+func TestParseFile_DefdelegateMultiLine(t *testing.T) {
+	path := writeTempFile(t, `defmodule BusinessDomain.ThirdPartyProvider do
+  alias BusinessDomain.ThirdPartyProvider.Finders.ListMatches
+
+  defdelegate list_matches(slug, opts),
+    to: ListMatches,
+    as: :call
+
+  defdelegate create_match(
+                open_items,
+                slug,
+                user_slug
+              ),
+              to: ListMatches,
+              as: :call
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "list_matches" {
+			if d.DelegateTo != "BusinessDomain.ThirdPartyProvider.Finders.ListMatches" {
+				t.Errorf("list_matches: expected DelegateTo BusinessDomain.ThirdPartyProvider.Finders.ListMatches, got %q", d.DelegateTo)
+			}
+		}
+		if d.Function == "create_match" {
+			if d.DelegateTo != "BusinessDomain.ThirdPartyProvider.Finders.ListMatches" {
+				t.Errorf("create_match: expected DelegateTo BusinessDomain.ThirdPartyProvider.Finders.ListMatches, got %q", d.DelegateTo)
+			}
+		}
+	}
+}
+
+func TestParseFile_DefdelegateAliasAsResolution(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Values.Timesheet do
+  alias MyApp.Serializer.Date, as: DateSerializer
+
+  defdelegate format(date), to: DateSerializer
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "format" {
+			if d.DelegateTo != "MyApp.Serializer.Date" {
+				t.Errorf("expected DelegateTo MyApp.Serializer.Date, got %q", d.DelegateTo)
+			}
+			return
+		}
+	}
+	t.Error("missing defdelegate format")
+}
+
+func TestParseFile_Defguard(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Guards do
+  defguard is_admin(user) when user.role == :admin
+  defguardp is_active(user) when user.status == :active
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kinds := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			kinds[d.Function] = d.Kind
+		}
+	}
+
+	if kinds["is_admin"] != "defguard" {
+		t.Errorf("expected defguard for is_admin, got %q", kinds["is_admin"])
+	}
+	if kinds["is_active"] != "defguardp" {
+		t.Errorf("expected defguardp for is_active, got %q", kinds["is_active"])
+	}
+}
+
+func TestParseFile_Defprotocol(t *testing.T) {
+	path := writeTempFile(t, `defprotocol MyApp.Formatter do
+  @doc "Formats a value"
+  def format(value)
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundProtocol := false
+	foundFunc := false
+	for _, d := range defs {
+		if d.Module == "MyApp.Formatter" && d.Kind == "defprotocol" {
+			foundProtocol = true
+		}
+		if d.Module == "MyApp.Formatter" && d.Function == "format" {
+			foundFunc = true
+		}
+	}
+
+	if !foundProtocol {
+		t.Error("missing defprotocol MyApp.Formatter")
+	}
+	if !foundFunc {
+		t.Error("missing def format in MyApp.Formatter")
+	}
+}
+
+func TestParseFile_Defimpl(t *testing.T) {
+	path := writeTempFile(t, `defimpl MyApp.Formatter, for: MyApp.User do
+  def format(user) do
+    user.name
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundImpl := false
+	foundFunc := false
+	for _, d := range defs {
+		if d.Kind == "defimpl" && d.Module == "MyApp.Formatter" {
+			foundImpl = true
+		}
+		if d.Function == "format" {
+			foundFunc = true
+		}
+	}
+
+	if !foundImpl {
+		t.Error("missing defimpl MyApp.Formatter")
+	}
+	if !foundFunc {
+		t.Error("missing def format in defimpl")
+	}
+}
+
+func TestParseFile_Defstruct(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.User do
+  defstruct [:name, :email, :role]
+
+  def new(attrs) do
+    struct!(__MODULE__, attrs)
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundStruct := false
+	for _, d := range defs {
+		if d.Kind == "defstruct" && d.Module == "MyApp.User" {
+			foundStruct = true
+		}
+	}
+
+	if !foundStruct {
+		t.Error("missing defstruct in MyApp.User")
+	}
+}
+
+func TestParseFile_Defexception(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.NotFoundError do
+  defexception message: "not found"
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundException := false
+	for _, d := range defs {
+		if d.Kind == "defexception" && d.Module == "MyApp.NotFoundError" {
+			foundException = true
+		}
+	}
+
+	if !foundException {
+		t.Error("missing defexception in MyApp.NotFoundError")
+	}
+}
+
+func TestParseFile_WhenGuards(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Validators do
+  def validate(x) when is_integer(x) and x > 0 do
+    :ok
+  end
+
+  def validate(x) when is_binary(x) do
+    :ok
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := 0
+	for _, d := range defs {
+		if d.Function == "validate" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("expected 2 validate heads, got %d", count)
+	}
+}
+
+func TestParseFile_InlineDoSyntax(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Math do
+  def add(a, b), do: a + b
+  defp secret(x), do: x * 2
+  def identity(x), do: x
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = d.Kind
+		}
+	}
+
+	if funcs["add"] != "def" {
+		t.Errorf("expected def for add, got %q", funcs["add"])
+	}
+	if funcs["secret"] != "defp" {
+		t.Errorf("expected defp for secret, got %q", funcs["secret"])
+	}
+	if funcs["identity"] != "def" {
+		t.Errorf("expected def for identity, got %q", funcs["identity"])
+	}
+}
+

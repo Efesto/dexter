@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +19,9 @@ func usage() {
 Usage:
   dexter init [--force] [path]    Full index of an Elixir project
   dexter reindex [file|path]      Re-index a single file or check all files for changes
-  dexter lookup [--strict] <module> [func]   Look up where a module/function is defined
+  dexter lookup [flags] <module> [func]   Look up where a module/function is defined
+    --strict               Exit 1 if exact match not found (no fallback)
+    --no-follow-delegates  Don't follow defdelegate to the target module
 Options:
   path defaults to the current directory
 `)
@@ -48,11 +51,18 @@ func main() {
 		cmdReindex(target)
 	case "lookup":
 		strict := false
+		followDelegates := true
 		lookupArgs := []string{}
 		for _, arg := range os.Args[2:] {
-			if arg == "--strict" {
+			switch {
+			case arg == "--strict":
 				strict = true
-			} else {
+			case arg == "--no-follow-delegates":
+				followDelegates = false
+			case strings.HasPrefix(arg, "--"):
+				fmt.Fprintf(os.Stderr, "Unknown option: %s\n", arg)
+				os.Exit(1)
+			default:
 				lookupArgs = append(lookupArgs, arg)
 			}
 		}
@@ -65,7 +75,7 @@ func main() {
 			function = lookupArgs[1]
 		}
 		projectRoot, _ := os.Getwd()
-		cmdLookup(projectRoot, module, function, strict)
+		cmdLookup(projectRoot, module, function, strict, followDelegates)
 	default:
 		usage()
 	}
@@ -281,7 +291,7 @@ func reindexFile(s *store.Store, path string) {
 	}
 }
 
-func cmdLookup(projectRoot string, module string, function string, strict bool) {
+func cmdLookup(projectRoot string, module string, function string, strict bool, followDelegates bool) {
 	projectRoot = findProjectRoot(projectRoot)
 	s, err := store.Open(projectRoot)
 	if err != nil {
@@ -290,7 +300,12 @@ func cmdLookup(projectRoot string, module string, function string, strict bool) 
 	defer s.Close()
 
 	if function != "" {
-		results, err := s.LookupFunction(module, function)
+		var results []store.LookupResult
+		if followDelegates {
+			results, err = s.LookupFollowDelegate(module, function)
+		} else {
+			results, err = s.LookupFunction(module, function)
+		}
 		if err != nil {
 			fatal(err)
 		}

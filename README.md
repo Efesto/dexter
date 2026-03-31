@@ -18,16 +18,12 @@ mise plugin add dexter git@gitlab.com:remote-com/employ-starbase/dexter.git
 mise install dexter@0.1.1
 mise use -g dexter@0.1.1
 
-# 3. Index your project (one-time, ~8s for a large codebase)
-# Run from your monorepo root — dexter will place .dexter.db next to your .git directory
-cd ~/code/my-elixir-project
-dexter init .
-
-# 4. Add .dexter.db to your .gitignore
+# 3. Add .dexter.db to your .gitignore
 echo ".dexter.db" >> .gitignore
 
-# 5. Configure your editor (see below)
-# When using the LSP server, dexter auto-builds the index on first startup if it doesn't exist
+# 4. Configure your editor (see below)
+# The LSP server auto-builds the index on first startup — no need to run dexter init manually.
+# You can still run it explicitly if you prefer: dexter init ~/code/my-elixir-project
 ```
 
 ### VS Code / Cursor extension
@@ -151,6 +147,28 @@ When running as an LSP server, dexter automatically:
 - Reindexes files on save (`textDocument/didSave`)
 - Runs an incremental reindex on startup
 - Watches `.git/HEAD` for branch switches and reindexes when detected
+
+## Index location (.dexter.db)
+
+Dexter creates `.dexter.db` at the root of your project. Where you place it determines what gets indexed.
+
+**Monorepo root (recommended)** — Put the index at the root of your repository, next to `.git`. This indexes everything: all apps, all shared libraries, and all deps. Go-to-definition works across the entire codebase.
+
+```sh
+cd ~/code/my-monorepo   # where .git lives
+dexter init .
+```
+
+**Single app** — Put the index inside a specific Mix project. Go-to-definition works within that app and its deps, but not across other apps in the monorepo.
+
+```sh
+cd ~/code/my-monorepo/apps/my_app
+dexter init .
+```
+
+When the LSP server starts, it walks up from the project root looking for `.dexter.db`, preferring `.git` as the anchor point. This means if you initialised from the monorepo root, the server will find the right database even when Neovim's `rootUri` points to a sub-app (e.g. because `mix.exs` is there).
+
+If no `.dexter.db` exists anywhere, the LSP server builds the index automatically on first startup.
 
 ## How it works
 

@@ -575,6 +575,105 @@ end
 	t.Error("missing defdelegate process")
 }
 
+func TestParseFile_FunctionsAfterNestedModules(t *testing.T) {
+	// Functions defined after nested modules (which close with `end`) should
+	// still belong to the outer module, not get mis-attributed due to over-popping.
+	path := writeTempFile(t, `defmodule Outer.Module do
+  defmodule Inner do
+    defstruct [:x]
+  end
+
+  defmodule OtherInner do
+    def helper do
+      :ok
+    end
+  end
+
+  def public_func(x) do
+    x + 1
+  end
+
+  defp private_func do
+    :hidden
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = d.Module
+		}
+	}
+
+	if funcs["public_func"] != "Outer.Module" {
+		t.Errorf("public_func should belong to Outer.Module, got %q", funcs["public_func"])
+	}
+	if funcs["private_func"] != "Outer.Module" {
+		t.Errorf("private_func should belong to Outer.Module, got %q", funcs["private_func"])
+	}
+	if funcs["helper"] != "Outer.Module.OtherInner" {
+		t.Errorf("helper should belong to Outer.Module.OtherInner, got %q", funcs["helper"])
+	}
+}
+
+func TestParseFile_MacroAfterManyFunctions(t *testing.T) {
+	// Simulates the Ecto.Query pattern: a macro defined after many function bodies
+	// whose `end`s would over-pop a naive module stack.
+	path := writeTempFile(t, `defmodule EctoLike.Query do
+  defmodule SubQuery do
+    defstruct [:query]
+  end
+
+  def first(query) do
+    query
+  end
+
+  def last(query) do
+    query
+  end
+
+  defp build(query) do
+    if query do
+      :ok
+    else
+      :error
+    end
+  end
+
+  defmacro from(expr, kw \\ []) do
+    quote do
+      unquote(expr)
+    end
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = d.Module
+		}
+	}
+
+	if funcs["from"] != "EctoLike.Query" {
+		t.Errorf("from macro should belong to EctoLike.Query, got %q", funcs["from"])
+	}
+	if funcs["first"] != "EctoLike.Query" {
+		t.Errorf("first should belong to EctoLike.Query, got %q", funcs["first"])
+	}
+}
+
 func TestParseFile_RelativeNestedModule(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyAppWeb.ApiDocs.Payslips do
   defmodule PayslipDownloadResponse do

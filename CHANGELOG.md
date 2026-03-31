@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.4] - 2026-03-30
+
+### Fixed
+
+- `defdelegate` lookahead now stops at new statement boundaries, preventing `as:` from a nearby defdelegate being incorrectly captured for an unrelated one
+- `defmacro` and other definitions after deeply nested modules are now correctly attributed to the outer module — depth tracking via `do...end` block counting replaces the naive bare-`end` pop heuristic
+- Relative nested `defmodule` names (e.g. `defmodule PayslipDownloadResponse do` inside `defmodule MyAppWeb.ApiDocs.Payslips do`) are now indexed as the fully-qualified `MyAppWeb.ApiDocs.Payslips.PayslipDownloadResponse`
+
 ## [0.1.3] - 2026-03-30
 
 ### Fixed

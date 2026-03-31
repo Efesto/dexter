@@ -22,6 +22,8 @@ var (
 	defexceptionRe = regexp.MustCompile(`^\s*defexception\s`)
 	delegateToRe   = regexp.MustCompile(`to:\s*([A-Za-z0-9_.]+)`)
 	delegateAsRe   = regexp.MustCompile(`as:\s*:?([a-z_][a-z0-9_?!]*)`)
+	// Matches lines that open a new do...end block (end with keyword `do`, not `do:`)
+	opensBlockRe = regexp.MustCompile(`\bdo\s*$`)
 )
 
 type Definition struct {
@@ -40,11 +42,17 @@ func ParseFile(path string) ([]Definition, error) {
 		return nil, err
 	}
 
+	type moduleFrame struct {
+		name  string
+		depth int // doDepth when this module's `do` was opened
+	}
+
 	lines := strings.Split(string(data), "\n")
 	var defs []Definition
-	var moduleStack []string
+	var moduleStack []moduleFrame
 	aliases := map[string]string{} // short name -> full module
 	inHeredoc := false
+	doDepth := 0
 
 	for lineIdx, line := range lines {
 		lineNum := lineIdx + 1
@@ -63,13 +71,21 @@ func ParseFile(path string) ([]Definition, error) {
 			continue
 		}
 
-		if trimmed == "end" && len(moduleStack) > 1 {
-			moduleStack = moduleStack[:len(moduleStack)-1]
+		// Decrement depth on bare `end`, and pop module if it was opened at this depth
+		if trimmed == "end" {
+			if len(moduleStack) > 1 && moduleStack[len(moduleStack)-1].depth == doDepth {
+				moduleStack = moduleStack[:len(moduleStack)-1]
+			}
+			if doDepth > 0 {
+				doDepth--
+			}
+		} else if opensBlockRe.MatchString(trimmed) {
+			doDepth++
 		}
 
 		currentModule := ""
 		if len(moduleStack) > 0 {
-			currentModule = moduleStack[len(moduleStack)-1]
+			currentModule = moduleStack[len(moduleStack)-1].name
 		}
 
 		// Track aliases, resolving __MODULE__ to the current module name
@@ -100,7 +116,7 @@ func ParseFile(path string) ([]Definition, error) {
 				name = currentModule + "." + name
 			}
 			currentModule = name
-			moduleStack = append(moduleStack, currentModule)
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: doDepth})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -112,7 +128,7 @@ func ParseFile(path string) ([]Definition, error) {
 
 		if m := defprotocolRe.FindStringSubmatch(line); m != nil {
 			currentModule = m[1]
-			moduleStack = append(moduleStack, currentModule)
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: doDepth})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -124,7 +140,7 @@ func ParseFile(path string) ([]Definition, error) {
 
 		if m := defimplRe.FindStringSubmatch(line); m != nil {
 			currentModule = m[1]
-			moduleStack = append(moduleStack, currentModule)
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: doDepth})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -184,8 +200,15 @@ func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string
 		end = len(lines)
 	}
 
+	// Matches a line that starts a new top-level statement — scanning must stop here.
+	newStatementRe := regexp.MustCompile(`^\s*(defdelegate|defp?|defmacrop?|defguardp?|alias|import|@|end)\b`)
+
 	var targetModule, targetFunc string
 	for i := startIdx; i < end; i++ {
+		// A new statement on any line after the first means the current defdelegate ended
+		if i > startIdx && newStatementRe.MatchString(lines[i]) {
+			break
+		}
 		if m := delegateToRe.FindStringSubmatch(lines[i]); m != nil && targetModule == "" {
 			target := m[1]
 			// Resolve __MODULE__ directly in to: field

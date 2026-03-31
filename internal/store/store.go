@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	_ "github.com/mattn/go-sqlite3"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
@@ -51,10 +52,37 @@ func migrate(db *sql.DB) error {
 			FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
 		);
 
+		CREATE TABLE IF NOT EXISTS metadata (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+
 		CREATE INDEX IF NOT EXISTS idx_definitions_module ON definitions(module);
 		CREATE INDEX IF NOT EXISTS idx_definitions_module_function ON definitions(module, function);
 		CREATE INDEX IF NOT EXISTS idx_definitions_file_path ON definitions(file_path);
 	`)
+	return err
+}
+
+// GetIndexVersion returns the index version stored in the database, or 0 if
+// none has been recorded yet (e.g. an index created before versioning was added).
+func (s *Store) GetIndexVersion() int {
+	var value string
+	err := s.db.QueryRow("SELECT value FROM metadata WHERE key = 'index_version'").Scan(&value)
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.Atoi(value)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// SetIndexVersion records the index version in the database. Call this after a
+// successful full index so that future startups can detect stale indexes.
+func (s *Store) SetIndexVersion(v int) error {
+	_, err := s.db.Exec("INSERT OR REPLACE INTO metadata (key, value) VALUES ('index_version', ?)", strconv.Itoa(v))
 	return err
 }
 

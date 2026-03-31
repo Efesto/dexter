@@ -31,10 +31,11 @@ Tests include unit tests for the parser, store, and LSP elixir analysis function
 - **Delegate following** — `defdelegate` targets are resolved at index time (including alias resolution and `as:` renames). Followed by default on lookup.
 - **Git HEAD polling** — the LSP server watches `.git/HEAD` mtime every 2 seconds to detect branch switches and trigger reindex.
 - **Full document sync** — the LSP uses `TextDocumentSyncKindFull` since Elixir files are small.
+- **Index versioning** — `internal/version/version.go` has an `IndexVersion` integer alongside `Version`. When the LSP server or `reindex` command starts, it checks the version stored in the `metadata` table against `IndexVersion`. A mismatch triggers an automatic forced rebuild. Bump `IndexVersion` (alongside `Version`) whenever a parser change or schema change would make existing indexes produce wrong results.
 
 ## Conventions
 
 - Keep the CLI commands (`init`, `reindex`, `lookup`) working independently of the LSP server
 - Parser tests should cover real-world Elixir patterns from large codebases
 - Integration tests scaffold a fake Elixir project with `mix.exs` and verify end-to-end behavior
-- Version string lives in `internal/lsp/server.go` in the `Initialize` response
+- Version strings (`Version` and `IndexVersion`) live in `internal/version/version.go`

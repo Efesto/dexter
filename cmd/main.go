@@ -217,6 +217,10 @@ func cmdInit(projectRoot string, force bool) {
 		defCount += len(res.defs)
 	}
 
+	if err := s.SetIndexVersion(version.IndexVersion); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to store index version: %v\n", err)
+	}
+
 	fmt.Fprintf(os.Stderr, "Indexed %d files (%d definitions) in %s\n", count, defCount, time.Since(start).Round(time.Millisecond))
 }
 
@@ -232,6 +236,13 @@ func cmdReindex(target string) {
 		fatal(err)
 	}
 	defer s.Close()
+
+	if stored := s.GetIndexVersion(); stored != version.IndexVersion {
+		fmt.Fprintf(os.Stderr, "Index version mismatch (stored: %d, current: %d), performing full rebuild...\n", stored, version.IndexVersion)
+		s.Close()
+		cmdInit(projectRoot, true)
+		return
+	}
 
 	if !info.IsDir() {
 		reindexFile(s, target)
@@ -320,6 +331,17 @@ func cmdLSP(projectRoot string) {
 	s, err := store.Open(projectRoot)
 	if err != nil {
 		fatal(err)
+	}
+
+	if stored := s.GetIndexVersion(); stored != version.IndexVersion {
+		log.SetOutput(os.Stderr)
+		log.Printf("Index version mismatch (stored: %d, current: %d), rebuilding index...", stored, version.IndexVersion)
+		s.Close()
+		cmdInit(projectRoot, true)
+		s, err = store.Open(projectRoot)
+		if err != nil {
+			fatal(err)
+		}
 	}
 	defer s.Close()
 

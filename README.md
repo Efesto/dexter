@@ -77,6 +77,29 @@ configs.dexter = {
 lspconfig.dexter.setup({})
 ```
 
+### Zed
+
+Install the [dexter-zed](https://gitlab.com/remote-com/employ-starbase/dexter-zed) extension:
+
+1. Clone the extension: `git clone git@gitlab.com:remote-com/employ-starbase/dexter-zed.git`
+2. In Zed, open the command palette (`Cmd+Shift+P`) and run **"zed: install dev extension"**
+3. Select the `dexter-zed/` directory
+
+Configure the binary path in Zed's `settings.json`:
+
+```json
+{
+  "lsp": {
+    "dexter": {
+      "binary": {
+        "path": "/Users/you/.local/share/mise/shims/dexter",
+        "arguments": ["lsp"],
+      }
+    }
+  }
+}
+```
+
 ### Cursor/VSCode
 
 Install the [dexter-vscode](https://gitlab.com/remote-com/employ-starbase/dexter-vscode) extension, then optionally set the binary path if dexter is not on your PATH:

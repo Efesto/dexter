@@ -13,6 +13,7 @@ import (
 	dexter_lsp "gitlab.com/remote-com/employ-starbase/dexter/internal/lsp"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
+	"gitlab.com/remote-com/employ-starbase/dexter/internal/stdlib"
 )
 
 func usage() {
@@ -56,7 +57,11 @@ func main() {
 		}
 		cmdInit(projectRoot, force)
 	case "reindex":
-		target := getPath(2)
+		pathIdx := 2
+		for i := 2; i < len(os.Args); i++ {
+			pathIdx = i
+		}
+		target := getPath(pathIdx)
 		cmdReindex(target)
 	case "lookup":
 		strict := false
@@ -86,7 +91,16 @@ func main() {
 		projectRoot, _ := os.Getwd()
 		cmdLookup(projectRoot, module, function, strict, followDelegates)
 	case "lsp":
-		projectRoot, _ := os.Getwd()
+		pathIdx := -1
+		for i := 2; i < len(os.Args); i++ {
+			pathIdx = i
+		}
+		var projectRoot string
+		if pathIdx >= 0 {
+			projectRoot = getPath(pathIdx)
+		} else {
+			projectRoot, _ = os.Getwd()
+		}
 		cmdLSP(projectRoot)
 	default:
 		usage()
@@ -163,6 +177,12 @@ func cmdInit(projectRoot string, force bool) {
 	if err != nil {
 		fatal(err)
 	}
+	if stdlibRoot, ok := stdlib.DetectElixirLibRoot(); ok {
+		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, info os.FileInfo) error {
+			paths = append(paths, path)
+			return nil
+		})
+	}
 
 	// Phase 2: parse in parallel
 	type parseResult struct {
@@ -236,7 +256,12 @@ func cmdReindex(target string) {
 	reindexed := 0
 	skipped := 0
 
-	err = parser.WalkElixirFiles(target, func(path string, fi os.FileInfo) error {
+	reindexWalkRoot := target
+	if !info.IsDir() {
+		reindexWalkRoot = projectRoot
+	}
+
+	walkFn := func(path string, fi os.FileInfo) error {
 		storedMtime, found := s.GetFileMtime(path)
 		currentMtime := fi.ModTime().UnixNano()
 		if found && storedMtime == currentMtime {
@@ -247,9 +272,14 @@ func cmdReindex(target string) {
 		reindexFile(s, path)
 		reindexed++
 		return nil
-	})
+	}
+
+	err = parser.WalkElixirFiles(reindexWalkRoot, walkFn)
 	if err != nil {
 		fatal(err)
+	}
+	if stdlibRoot, ok := stdlib.DetectElixirLibRoot(); ok {
+		_ = parser.WalkElixirFiles(stdlibRoot, walkFn)
 	}
 
 	fmt.Fprintf(os.Stderr, "Reindexed %d files, %d unchanged (%s)\n", reindexed, skipped, time.Since(start).Round(time.Millisecond))
@@ -320,7 +350,8 @@ func cmdLSP(projectRoot string) {
 	log.SetOutput(os.Stderr)
 	log.Printf("Dexter LSP starting (root: %s)", projectRoot)
 
-	if err := dexter_lsp.Serve(os.Stdin, os.Stdout, s, projectRoot); err != nil {
+	// Always include stdlib by default; can be overridden by LSP initializationOptions.
+	if err := dexter_lsp.Serve(os.Stdin, os.Stdout, s, projectRoot, true); err != nil {
 		fatal(err)
 	}
 }

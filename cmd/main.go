@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	dexter_lsp "gitlab.com/remote-com/employ-starbase/dexter/internal/lsp"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
 )
@@ -22,6 +24,8 @@ Usage:
   dexter lookup [flags] <module> [func]   Look up where a module/function is defined
     --strict               Exit 1 if exact match not found (no fallback)
     --no-follow-delegates  Don't follow defdelegate to the target module
+  dexter lsp [path]               Start the LSP server (stdio)
+
 Options:
   path defaults to the current directory
 `)
@@ -76,6 +80,9 @@ func main() {
 		}
 		projectRoot, _ := os.Getwd()
 		cmdLookup(projectRoot, module, function, strict, followDelegates)
+	case "lsp":
+		projectRoot, _ := os.Getwd()
+		cmdLSP(projectRoot)
 	default:
 		usage()
 	}
@@ -330,6 +337,29 @@ func cmdLookup(projectRoot string, module string, function string, strict bool, 
 	}
 	for _, r := range results {
 		fmt.Printf("%s:%d\n", r.FilePath, r.Line)
+	}
+}
+
+func cmdLSP(projectRoot string) {
+	projectRoot = findProjectRoot(projectRoot)
+
+	dbPath := filepath.Join(projectRoot, ".dexter.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		fmt.Fprintf(os.Stderr, "No index found at %s. Run `dexter init` first.\n", dbPath)
+		os.Exit(1)
+	}
+
+	s, err := store.Open(projectRoot)
+	if err != nil {
+		fatal(err)
+	}
+	defer s.Close()
+
+	log.SetOutput(os.Stderr)
+	log.Printf("Dexter LSP starting (root: %s)", projectRoot)
+
+	if err := dexter_lsp.Serve(os.Stdin, os.Stdout, s, projectRoot); err != nil {
+		fatal(err)
 	}
 }
 

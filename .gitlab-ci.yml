@@ -1,0 +1,45 @@
+stages:
+  - test
+
+variables:
+  CGO_ENABLED: "1"
+  GOLANGCI_LINT_VERSION: v2.2.1
+
+test:
+  stage: test
+  image: golang:1.26
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - /go/pkg/mod/
+  script:
+    - go test ./... -coverprofile=coverage.txt -covermode count
+    - go run github.com/boumenot/gocover-cobertura < coverage.txt > coverage.xml
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+  coverage: '/\d+\.\d+% of statements/'
+  tags:
+    - size-m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+lint:
+  stage: test
+  image: golangci/golangci-lint:$GOLANGCI_LINT_VERSION
+  script:
+    - golangci-lint run ./... --output.code-climate.path=gl-code-quality-report.json
+  artifacts:
+    reports:
+      codequality: gl-code-quality-report.json
+    paths:
+      - gl-code-quality-report.json
+  tags:
+    - size-m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

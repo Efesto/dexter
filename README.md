@@ -219,8 +219,12 @@ make test
 make release VERSION=0.2.0
 ```
 
-This updates the version in `internal/lsp/server.go`, commits, tags, and pushes. Users can then upgrade via mise:
+This updates the version in `internal/version/version.go`, commits, tags, and pushes. Users can then upgrade via mise:
 
 ```sh
-mise install dexter@latest
+mise plugin update dexter && mise install dexter@latest
 ```
+
+The plugin update step is required to pick up newly tagged releases — without it, `mise install dexter@latest` will resolve against a stale list.
+
+If the release changes how Elixir files are parsed or what gets stored in the index (e.g. a new definition kind, a change to delegate resolution), also bump `IndexVersion` in `internal/version/version.go`. Dexter will automatically rebuild the index when users upgrade to a binary with a higher `IndexVersion` — no manual `dexter init --force` required.

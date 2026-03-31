@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0] - 2026-03-31
+
+### Changed
+
+- CLI commands (`init`, `reindex`, `lookup`, `lsp`) are now implemented with [cobra](https://github.com/spf13/cobra), improving help output and flag handling
+- Version string moved to `internal/version/version.go` as a single source of truth; `make release VERSION=x.y.z` now updates that file instead of `server.go`
+
 ## [0.1.4] - 2026-03-30
 
 ### Fixed

@@ -239,7 +239,7 @@ func ExtractUses(text string) []string {
 // quote do block. These definitions get injected into any module that `use`s
 // the parent module.
 type inlineDef struct {
-	line  int    // 1-based line number in the source file
+	line  int // 1-based line number in the source file
 	arity int
 	kind  string // "def", "defp", "defmacro", etc.
 }

@@ -6,6 +6,9 @@ build:
 test:
 	go test ./...
 
+lint:
+	golangci-lint run ./...
+
 release:
 	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=0.2.0"; exit 1; fi
 	@sed -i '' 's/"0\.[0-9]*\.[0-9]*"/"$(VERSION)"/' internal/version/version.go

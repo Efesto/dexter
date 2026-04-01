@@ -30,9 +30,9 @@ import (
 type usingCacheEntry struct {
 	mtime      int64
 	filePath   string
-	imports    []string                  // modules imported in __using__, source order
-	inlineDefs map[string][]inlineDef    // function name → inline defs in quote do block
-	transUses  []string                  // modules used inside __using__ body (double-use chains)
+	imports    []string               // modules imported in __using__, source order
+	inlineDefs map[string][]inlineDef // function name → inline defs in quote do block
+	transUses  []string               // modules used inside __using__ body (double-use chains)
 }
 
 type Server struct {

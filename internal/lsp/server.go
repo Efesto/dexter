@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.lsp.dev/jsonrpc2"
@@ -23,6 +24,17 @@ import (
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
 )
 
+// usingCacheEntry holds the full parsed result of a module's defmacro __using__
+// body, keyed by module name. Storing filePath avoids a LookupModule query on
+// cache hits; mtime invalidates the entry when the source file changes.
+type usingCacheEntry struct {
+	mtime      int64
+	filePath   string
+	imports    []string                  // modules imported in __using__, source order
+	inlineDefs map[string][]inlineDef    // function name → inline defs in quote do block
+	transUses  []string                  // modules used inside __using__ body (double-use chains)
+}
+
 type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
@@ -31,6 +43,9 @@ type Server struct {
 	initialized     bool
 	client          protocol.Client
 	followDelegates bool
+
+	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
+	usingCacheMu sync.RWMutex
 }
 
 func NewServer(s *store.Store, projectRoot string) *Server {
@@ -38,7 +53,8 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		store:           s,
 		docs:            NewDocumentStore(),
 		projectRoot:     projectRoot,
-		followDelegates: true, // default
+		followDelegates: true,
+		usingCache:      make(map[string]*usingCacheEntry),
 	}
 }
 
@@ -359,6 +375,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	aliases := ExtractAliases(text)
 
 	// Bare function call — check local buffer, then imports
 	if moduleRef == "" {
@@ -386,11 +403,15 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			}
 		}
 
+		// Check use-injected imports and inline defs
+		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
+			return storeResultsToLocations(results), nil
+		}
+
 		return nil, nil
 	}
 
 	// Module.function call — resolve aliases, then look up
-	aliases := ExtractAliases(text)
 	fullModule := moduleRef
 	if resolved, ok := aliases[moduleRef]; ok {
 		// Exact alias: "Foo" -> "MyApp.Handlers.Foo"
@@ -639,6 +660,13 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 				}
 			}
 		}
+
+		// Check use-injected imports and inline defs (including transitive use chains)
+		aliases := ExtractAliases(text)
+		visitedCompletion := make(map[string]bool)
+		for _, usedModule := range ExtractUses(text) {
+			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion)
+		}
 	}
 
 	if len(items) == 0 {
@@ -649,6 +677,194 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		IsIncomplete: false,
 		Items:        items,
 	}, nil
+}
+
+// cachedUsing returns the parsed __using__ body for the given module name.
+// The result is cached by module name; filePath is stored in the entry so
+// LookupModule is only called on the first access. The cache is invalidated
+// when the source file's mtime changes.
+func (s *Server) cachedUsing(moduleName string) *usingCacheEntry {
+	s.usingCacheMu.RLock()
+	entry, ok := s.usingCache[moduleName]
+	s.usingCacheMu.RUnlock()
+
+	if ok {
+		info, err := os.Stat(entry.filePath)
+		if err == nil && info.ModTime().UnixNano() == entry.mtime {
+			return entry
+		}
+		// File changed — re-parse using the cached path (no LookupModule needed)
+		if newEntry := s.parseUsingFile(entry.filePath); newEntry != nil {
+			s.usingCacheMu.Lock()
+			s.usingCache[moduleName] = newEntry
+			s.usingCacheMu.Unlock()
+			return newEntry
+		}
+		return nil
+	}
+
+	// Cache miss — look up file path from the store (only on first access)
+	modResults, err := s.store.LookupModule(moduleName)
+	if err != nil || len(modResults) == 0 {
+		return nil
+	}
+	filePath := filepath.Clean(modResults[0].FilePath)
+	newEntry := s.parseUsingFile(filePath)
+	if newEntry == nil {
+		return nil
+	}
+	s.usingCacheMu.Lock()
+	s.usingCache[moduleName] = newEntry
+	s.usingCacheMu.Unlock()
+	return newEntry
+}
+
+func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
+	fileData, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil
+	}
+	imported, inlineDefs, transUses := parseUsingBody(string(fileData))
+	return &usingCacheEntry{
+		mtime:      info.ModTime().UnixNano(),
+		filePath:   filePath,
+		imports:    imported,
+		inlineDefs: inlineDefs,
+		transUses:  transUses,
+	}
+}
+
+// lookupThroughUse searches for functionName in definitions injected by `use`
+// declarations. Inline defs (defined directly in the quote do block) take
+// priority over imported ones. Later `use` declarations shadow earlier ones.
+// Transitive use chains (use inside __using__ body) are followed recursively.
+func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]string) []store.LookupResult {
+	uses := ExtractUses(text)
+	visited := make(map[string]bool)
+
+	for i := len(uses) - 1; i >= 0; i-- {
+		moduleName := resolveModule(uses[i], aliases)
+		if result := s.lookupInUsingEntry(moduleName, functionName, visited); result != nil {
+			return result
+		}
+	}
+	return nil
+}
+
+// lookupInUsingEntry resolves functionName through a single module's __using__
+// body, then recurses into any transitive uses. The visited set prevents cycles.
+func (s *Server) lookupInUsingEntry(moduleName, functionName string, visited map[string]bool) []store.LookupResult {
+	if visited[moduleName] {
+		return nil
+	}
+	visited[moduleName] = true
+
+	entry := s.cachedUsing(moduleName)
+	if entry == nil {
+		return nil
+	}
+
+	// Inline defs take priority: directly injected by the quote do block
+	if defs, ok := entry.inlineDefs[functionName]; ok {
+		var results []store.LookupResult
+		for _, d := range defs {
+			results = append(results, store.LookupResult{FilePath: entry.filePath, Line: d.line})
+		}
+		return results
+	}
+
+	// Imported modules (last import in __using__ wins → iterate in reverse)
+	for j := len(entry.imports) - 1; j >= 0; j-- {
+		var results []store.LookupResult
+		var err error
+		if s.followDelegates {
+			results, err = s.store.LookupFollowDelegate(entry.imports[j], functionName)
+		} else {
+			results, err = s.store.LookupFunction(entry.imports[j], functionName)
+		}
+		if err != nil || len(results) == 0 {
+			continue
+		}
+		return results
+	}
+
+	// Transitive uses: use Module inside the __using__ body (double-use chains)
+	for k := len(entry.transUses) - 1; k >= 0; k-- {
+		if result := s.lookupInUsingEntry(entry.transUses[k], functionName, visited); result != nil {
+			return result
+		}
+	}
+
+	return nil
+}
+
+// addCompletionsFromUsing adds completion items injected by a module's __using__
+// body — inline defs, imported functions, and transitive uses — into items.
+func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool) {
+	if visited[moduleName] {
+		return
+	}
+	visited[moduleName] = true
+
+	entry := s.cachedUsing(moduleName)
+	if entry == nil {
+		return
+	}
+
+	for funcName, defs := range entry.inlineDefs {
+		if !strings.HasPrefix(funcName, funcPrefix) {
+			continue
+		}
+		for _, d := range defs {
+			key := funcKey(funcName, d.arity)
+			if !seen[key] {
+				seen[key] = true
+				item := protocol.CompletionItem{
+					Label:  funcName,
+					Kind:   kindToCompletionItemKind(d.kind),
+					Detail: d.kind,
+					Data: map[string]interface{}{
+						"filePath": entry.filePath,
+						"line":     d.line,
+					},
+				}
+				applySnippet(&item, funcName, d.arity)
+				*items = append(*items, item)
+			}
+		}
+	}
+
+	for _, mod := range entry.imports {
+		results, err := s.store.ListModuleFunctions(mod, true)
+		if err != nil {
+			continue
+		}
+		for _, r := range results {
+			key := funcKey(r.Function, r.Arity)
+			if strings.HasPrefix(r.Function, funcPrefix) && !seen[key] {
+				seen[key] = true
+				item := protocol.CompletionItem{
+					Label:  r.Function,
+					Kind:   kindToCompletionItemKind(r.Kind),
+					Detail: r.Module + " (" + r.Kind + ")",
+					Data: map[string]interface{}{
+						"filePath": r.FilePath,
+						"line":     r.Line,
+					},
+				}
+				applySnippet(&item, r.Function, r.Arity)
+				*items = append(*items, item)
+			}
+		}
+	}
+
+	for _, transModule := range entry.transUses {
+		s.addCompletionsFromUsing(transModule, funcPrefix, seen, items, visited)
+	}
 }
 
 func resolveModule(moduleRef string, aliases map[string]string) string {
@@ -834,10 +1050,21 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		}
 
 		for _, mod := range ExtractImports(text) {
-			results, err := s.store.LookupFunction(mod, functionName)
+			var results []store.LookupResult
+			var err error
+			if s.followDelegates {
+				results, err = s.store.LookupFollowDelegate(mod, functionName)
+			} else {
+				results, err = s.store.LookupFunction(mod, functionName)
+			}
 			if err != nil || len(results) == 0 {
 				continue
 			}
+			return s.hoverFromFile(functionName, results[0])
+		}
+
+		// Check use-injected imports and inline defs
+		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			return s.hoverFromFile(functionName, results[0])
 		}
 

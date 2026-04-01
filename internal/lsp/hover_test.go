@@ -580,6 +580,128 @@ end`
 	}
 }
 
+func TestHover_UseInjectedImport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Index the module that will be `use`d — it imports itself via an alias
+	indexFile(t, server.store, server.projectRoot, "lib/my_schema.ex", `defmodule MyApp.Schema do
+  alias MyApp.Schema
+
+  defmacro __using__(_opts) do
+    quote do
+      import Ecto.Schema
+      import Schema
+    end
+  end
+
+  @doc """
+  Defines a schema with extended options.
+  """
+  defmacro schema(source, do: block) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Schema
+
+  schema "users" do
+  end
+end`)
+
+	// col=2 is on 's' of "schema" (bare call)
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for use-injected macro")
+	}
+	if !strings.Contains(hover.Contents.Value, "Defines a schema with extended options") {
+		t.Errorf("expected doc for schema macro, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_UseInjectedInlineDef(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Index the module with a function defined inline in the quote do block
+	indexFile(t, server.store, server.projectRoot, "lib/my_helpers.ex", `defmodule MyApp.Helpers do
+  defmacro __using__(_opts) do
+    quote do
+      @doc "Doubles the value."
+      def double(x), do: x * 2
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Helpers
+
+  def call do
+    double(5)
+  end
+end`)
+
+	// col=4 is on 'd' of "double" (bare call)
+	hover := hoverAt(t, server, uri, 4, 4)
+	if hover == nil {
+		t.Fatal("expected hover for use-injected inline def")
+	}
+	if !strings.Contains(hover.Contents.Value, "double") {
+		t.Errorf("expected signature for inline def, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_DoubleUseChain(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Middleware layer: its __using__ delegates to the base layer via use
+	indexFile(t, server.store, server.projectRoot, "lib/base_worker.ex", `defmodule MyApp.BaseWorker do
+  defmacro __using__(_opts) do
+    quote do
+      import MyApp.BaseWorker, only: [args_schema: 1]
+    end
+  end
+
+  @doc "Defines the argument schema."
+  defmacro args_schema(do: _block) do
+    quote do: :ok
+  end
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/workflow.ex", `defmodule MyApp.Workflow do
+  defmacro __using__(opts) do
+    quote do
+      use MyApp.BaseWorker, unquote(opts)
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.FileWorker do
+  use MyApp.Workflow
+
+  args_schema do
+    :ok
+  end
+end`)
+
+	// col=2 is on 'a' of "args_schema"
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for double-use-injected macro")
+	}
+	if !strings.Contains(hover.Contents.Value, "args_schema") {
+		t.Errorf("expected args_schema in hover, got %q", hover.Contents.Value)
+	}
+}
+
 func TestHover_SigilHeredoc(t *testing.T) {
 	src := `defmodule MyApp.Users do
   @doc ~S"""

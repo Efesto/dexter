@@ -945,6 +945,91 @@ end
 	}
 }
 
+func TestCompletion_UseInjectedImport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Index the used module — __using__ imports itself (alias Schema → MyApp.Schema)
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", `defmodule MyApp.Schema do
+  alias MyApp.Schema
+
+  defmacro __using__(_opts) do
+    quote do
+      import Schema
+    end
+  end
+
+  @doc "Defines a schema."
+  defmacro schema(source, do: block) do
+    :ok
+  end
+
+  defmacro embedded_schema(do: block) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Schema
+
+  sch
+end`)
+
+	// col=5 — cursor after "sch" (prefix "sch")
+	items := completionAt(t, server, uri, 3, 5)
+	if !hasCompletionItem(items, "schema") {
+		t.Errorf("expected 'schema' in completions from use-injected import, got %v",
+			func() []string {
+				var labels []string
+				for _, item := range items {
+					labels = append(labels, item.Label)
+				}
+				return labels
+			}())
+	}
+}
+
+func TestCompletion_UseInjectedInlineDef(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/helpers.ex", `defmodule MyApp.Helpers do
+  defmacro __using__(_opts) do
+    quote do
+      def double(x), do: x * 2
+      def triple(x), do: x * 3
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+
+	// "do" prefix — should match double
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Helpers
+
+  do
+end`)
+	items := completionAt(t, server, uri, 3, 4)
+	if !hasCompletionItem(items, "double") {
+		t.Error("expected 'double' in completions from use-injected inline def")
+	}
+
+	// "tr" prefix — should match triple
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Helpers
+
+  tr
+end`)
+	items = completionAt(t, server, uri, 3, 4)
+	if !hasCompletionItem(items, "triple") {
+		t.Error("expected 'triple' in completions from use-injected inline def")
+	}
+}
+
 func TestDetectElixirStdlibRoot(t *testing.T) {
 	root, ok := stdlib.DetectElixirLibRoot()
 	if !ok {

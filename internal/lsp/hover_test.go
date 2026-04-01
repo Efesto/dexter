@@ -580,6 +580,264 @@ end`
 	}
 }
 
+func TestHover_UseInjectedImport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Index the module that will be `use`d — it imports itself via an alias
+	indexFile(t, server.store, server.projectRoot, "lib/my_schema.ex", `defmodule MyApp.Schema do
+  alias MyApp.Schema
+
+  defmacro __using__(_opts) do
+    quote do
+      import Ecto.Schema
+      import Schema
+    end
+  end
+
+  @doc """
+  Defines a schema with extended options.
+  """
+  defmacro schema(source, do: block) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Schema
+
+  schema "users" do
+  end
+end`)
+
+	// col=2 is on 's' of "schema" (bare call)
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for use-injected macro")
+	}
+	if !strings.Contains(hover.Contents.Value, "Defines a schema with extended options") {
+		t.Errorf("expected doc for schema macro, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_UseInjectedInlineDef(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Index the module with a function defined inline in the quote do block
+	indexFile(t, server.store, server.projectRoot, "lib/my_helpers.ex", `defmodule MyApp.Helpers do
+  defmacro __using__(_opts) do
+    quote do
+      @doc "Doubles the value."
+      def double(x), do: x * 2
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Helpers
+
+  def call do
+    double(5)
+  end
+end`)
+
+	// col=4 is on 'd' of "double" (bare call)
+	hover := hoverAt(t, server, uri, 4, 4)
+	if hover == nil {
+		t.Fatal("expected hover for use-injected inline def")
+	}
+	if !strings.Contains(hover.Contents.Value, "double") {
+		t.Errorf("expected signature for inline def, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_DoubleUseChain(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Middleware layer: its __using__ delegates to the base layer via use
+	indexFile(t, server.store, server.projectRoot, "lib/base_worker.ex", `defmodule MyApp.BaseWorker do
+  defmacro __using__(_opts) do
+    quote do
+      import MyApp.BaseWorker, only: [args_schema: 1]
+    end
+  end
+
+  @doc "Defines the argument schema."
+  defmacro args_schema(do: _block) do
+    quote do: :ok
+  end
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/workflow.ex", `defmodule MyApp.Workflow do
+  defmacro __using__(opts) do
+    quote do
+      use MyApp.BaseWorker, unquote(opts)
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.FileWorker do
+  use MyApp.Workflow
+
+  args_schema do
+    :ok
+  end
+end`)
+
+	// col=2 is on 'a' of "args_schema"
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for double-use-injected macro")
+	}
+	if !strings.Contains(hover.Contents.Value, "args_schema") {
+		t.Errorf("expected args_schema in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_TripleUseChain_DynamicModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Base layer: defines args_schema macro and imports it in __using__
+	indexFile(t, server.store, server.projectRoot, "lib/pro_worker.ex", `defmodule Oban.Pro.Worker do
+  defmacro __using__(_opts) do
+    quote do
+      import Oban.Pro.Worker, only: [args_schema: 1]
+    end
+  end
+
+  @doc "Defines the argument schema."
+  defmacro args_schema(do: _block) do
+    quote do: :ok
+  end
+end
+`)
+	// Middle layer: uses a dynamic module via unquote(oban_module)
+	indexFile(t, server.store, server.projectRoot, "lib/oban_worker.ex", `defmodule Remote.Oban.Worker do
+  defmacro __using__(opts) do
+    {oban_module, opts} = Keyword.pop(opts, :oban_module, Oban.Worker)
+
+    quote do
+      use unquote(oban_module), unquote(opts)
+    end
+  end
+end
+`)
+	// Top layer: sets oban_module to Oban.Pro.Worker via Keyword.put_new
+	indexFile(t, server.store, server.projectRoot, "lib/pro_wrapper.ex", `defmodule Remote.Oban.Pro.Worker do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
+
+    quote do
+      use Remote.Oban.Worker, unquote(opts)
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.FileWorker do
+  use Remote.Oban.Pro.Worker, owner: :my_team, queue: :default
+
+  args_schema do
+    field :employer_id, :id, required: true
+  end
+end`)
+
+	// col=2 is on 'a' of "args_schema"
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for triple-use-chain with dynamic module")
+	}
+	if !strings.Contains(hover.Contents.Value, "args_schema") {
+		t.Errorf("expected args_schema in hover, got %q", hover.Contents.Value)
+	}
+	if !strings.Contains(hover.Contents.Value, "Defines the argument schema") {
+		t.Errorf("expected doc content in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_DocSinceBeforeDef(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Mirrors Oban.Pro.Worker's exact structure: __using__ body with inline defs
+	// and @doc false, then @doc heredoc + @doc since: before the target defmacro
+	indexFile(t, server.store, server.projectRoot, "lib/pro_worker.ex", `defmodule Oban.Pro.Worker do
+  defmacro __using__(_opts) do
+    quote do
+      import Oban.Pro.Worker, only: [args_schema: 1]
+
+      @doc false
+      def __verify_stages__(module), do: module.__stages__()
+
+      @doc false
+      def __stages__ do
+        :ok
+      end
+
+      def __opts__, do: []
+
+      def new(args, opts \\ []), do: :ok
+
+      def backoff(job), do: :ok
+
+      def timeout(job), do: :ok
+
+      def perform(job), do: :ok
+
+      def fetch_recorded(job), do: :ok
+
+      defoverridable backoff: 1, new: 2, perform: 1, timeout: 1
+    end
+  end
+
+  @doc """
+  Define an args schema struct with field definitions.
+
+  ## Example
+
+      defmodule MyApp.Worker do
+        use Oban.Pro.Worker
+
+        args_schema do
+          field :id, :id, required: true
+        end
+      end
+  """
+  @doc since: "0.14.0"
+  defmacro args_schema(do: _block) do
+    quote do: :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Worker do
+  use Oban.Pro.Worker
+
+  args_schema do
+    :ok
+  end
+end`)
+
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for args_schema with @doc since:")
+	}
+	if !strings.Contains(hover.Contents.Value, "Define an args schema struct") {
+		t.Errorf("expected doc content before @doc since:, got %q", hover.Contents.Value)
+	}
+}
+
 func TestHover_SigilHeredoc(t *testing.T) {
 	src := `defmodule MyApp.Users do
   @doc ~S"""
@@ -599,5 +857,61 @@ end`
 	}
 	if !strings.Contains(doc, "#{interpolation}") {
 		t.Errorf("expected raw interpolation preserved, got %q", doc)
+	}
+}
+
+func TestHover_ModuleKeyword(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Accounts do
+  @moduledoc "Manages user accounts."
+
+  alias __MODULE__.User
+
+  def get_user(id), do: {:ok, id}
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", src)
+	uri := "file:///test.ex"
+	server.docs.Set(uri, src)
+
+	// col=9 is on '__MODULE__' in the alias line (line 3)
+	hover := hoverAt(t, server, uri, 3, 9)
+	if hover == nil {
+		t.Fatal("expected hover for __MODULE__")
+	}
+	if !strings.Contains(hover.Contents.Value, "MyApp.Accounts") {
+		t.Errorf("expected module name in hover, got %q", hover.Contents.Value)
+	}
+	if !strings.Contains(hover.Contents.Value, "Manages user accounts") {
+		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_ModuleKeywordSubmodule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts/user.ex", `defmodule MyApp.Accounts.User do
+  @moduledoc "Represents a user."
+  def new, do: %{}
+end`)
+
+	src := `defmodule MyApp.Accounts do
+  alias __MODULE__.User
+
+  def get_user(id), do: User.new()
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", src)
+	uri := "file:///test.ex"
+	server.docs.Set(uri, src)
+
+	// col=9 is on 'User' in alias __MODULE__.User (line 1)
+	hover := hoverAt(t, server, uri, 1, 20)
+	if hover == nil {
+		t.Fatal("expected hover for __MODULE__.User")
+	}
+	if !strings.Contains(hover.Contents.Value, "MyApp.Accounts.User") {
+		t.Errorf("expected submodule in hover, got %q", hover.Contents.Value)
 	}
 }

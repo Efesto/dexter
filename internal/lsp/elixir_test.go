@@ -592,6 +592,246 @@ func TestExtractCompletionContext(t *testing.T) {
 	}
 }
 
+func TestExtractUses(t *testing.T) {
+	t.Run("extracts use declarations", func(t *testing.T) {
+		text := "defmodule Foo do\n  use Ecto.Schema\n  use Remote.Ecto.Schema\n  use GenServer\nend"
+		uses := ExtractUses(text)
+		if len(uses) != 3 {
+			t.Fatalf("expected 3 uses, got %d: %v", len(uses), uses)
+		}
+		if uses[0] != "Ecto.Schema" {
+			t.Errorf("uses[0]: got %q, want Ecto.Schema", uses[0])
+		}
+		if uses[1] != "Remote.Ecto.Schema" {
+			t.Errorf("uses[1]: got %q, want Remote.Ecto.Schema", uses[1])
+		}
+		if uses[2] != "GenServer" {
+			t.Errorf("uses[2]: got %q, want GenServer", uses[2])
+		}
+	})
+
+	t.Run("ignores non-use lines", func(t *testing.T) {
+		text := "defmodule Foo do\n  alias MyApp.Repo\n  import Ecto.Query\nend"
+		uses := ExtractUses(text)
+		if len(uses) != 0 {
+			t.Errorf("expected 0 uses, got %d: %v", len(uses), uses)
+		}
+	})
+
+	t.Run("empty text", func(t *testing.T) {
+		uses := ExtractUses("")
+		if len(uses) != 0 {
+			t.Errorf("expected 0 uses, got %d", len(uses))
+		}
+	})
+}
+
+func TestExtractUsingImports(t *testing.T) {
+	t.Run("extracts and resolves alias", func(t *testing.T) {
+		// Mirrors Remote.Ecto.Schema's __using__ structure
+		text := `defmodule Remote.Ecto.Schema do
+  alias Remote.Ecto.Schema
+
+  defmacro __using__(args \\ []) do
+    quote do
+      import Ecto.Schema, except: [schema: 2]
+      import Schema
+      alias Remote.Ecto.Schema.Fields
+    end
+  end
+
+  defmacro schema(source, do: block) do
+    :ok
+  end
+end`
+		imports := extractUsingImports(text)
+		if len(imports) != 2 {
+			t.Fatalf("expected 2 imports, got %d: %v", len(imports), imports)
+		}
+		if imports[0] != "Ecto.Schema" {
+			t.Errorf("imports[0]: got %q, want Ecto.Schema", imports[0])
+		}
+		// "import Schema" resolves via "alias Remote.Ecto.Schema" → Schema
+		if imports[1] != "Remote.Ecto.Schema" {
+			t.Errorf("imports[1]: got %q, want Remote.Ecto.Schema", imports[1])
+		}
+	})
+
+	t.Run("stops at next def at same indent", func(t *testing.T) {
+		text := `defmodule Lib do
+  defmacro __using__(_) do
+    quote do
+      import Foo
+    end
+  end
+
+  def other_func, do: :ok
+end`
+		imports := extractUsingImports(text)
+		if len(imports) != 1 || imports[0] != "Foo" {
+			t.Errorf("expected [Foo], got %v", imports)
+		}
+	})
+
+	t.Run("no __using__ returns nil", func(t *testing.T) {
+		text := "defmodule Lib do\n  def foo, do: :ok\nend"
+		imports := extractUsingImports(text)
+		if len(imports) != 0 {
+			t.Errorf("expected no imports, got %v", imports)
+		}
+	})
+}
+
+func TestExtractUsingInlineDefs(t *testing.T) {
+	text := `defmodule MyLib do
+  defmacro __using__(_opts) do
+    quote do
+      def helper(x), do: x * 2
+      def other(y), do: y
+    end
+  end
+
+  def module_level, do: :ok
+end`
+
+	t.Run("finds inline def", func(t *testing.T) {
+		lineNums := extractUsingInlineDefs(text, "helper")
+		if len(lineNums) != 1 || lineNums[0] != 4 {
+			t.Errorf("expected [4], got %v", lineNums)
+		}
+	})
+
+	t.Run("does not find module-level def", func(t *testing.T) {
+		lineNums := extractUsingInlineDefs(text, "module_level")
+		if len(lineNums) != 0 {
+			t.Errorf("expected empty, got %v", lineNums)
+		}
+	})
+
+	t.Run("returns empty for missing function", func(t *testing.T) {
+		lineNums := extractUsingInlineDefs(text, "nonexistent")
+		if len(lineNums) != 0 {
+			t.Errorf("expected empty, got %v", lineNums)
+		}
+	})
+}
+
+func TestParseUsingBody_InlineDefArity(t *testing.T) {
+	text := `defmodule MyLib do
+  defmacro __using__(_opts) do
+    quote do
+      def zero_arity, do: :ok
+      def one_arity(x), do: x
+      def two_arity(x, y), do: x + y
+      defmacro my_macro(ast), do: ast
+    end
+  end
+end`
+	_, inlineDefs, _ := parseUsingBody(text)
+
+	check := func(name string, wantArity int, wantKind string) {
+		t.Helper()
+		defs, ok := inlineDefs[name]
+		if !ok || len(defs) == 0 {
+			t.Errorf("%s: not found in inline defs", name)
+			return
+		}
+		if defs[0].arity != wantArity {
+			t.Errorf("%s: arity=%d, want %d", name, defs[0].arity, wantArity)
+		}
+		if defs[0].kind != wantKind {
+			t.Errorf("%s: kind=%q, want %q", name, defs[0].kind, wantKind)
+		}
+	}
+
+	check("zero_arity", 0, "def")
+	check("one_arity", 1, "def")
+	check("two_arity", 2, "def")
+	check("my_macro", 1, "defmacro")
+}
+
+func TestParseUsingBody_SkipsUnquoteUse(t *testing.T) {
+	text := `defmodule Remote.Oban.Worker do
+  defmacro __using__(opts) do
+    {oban_module, opts} = Keyword.pop(opts, :oban_module, Oban.Worker)
+
+    quote do
+      use unquote(oban_module), unquote(opts)
+    end
+  end
+end`
+	_, _, transUses := parseUsingBody(text)
+	for _, u := range transUses {
+		if u == "unquote" {
+			t.Error("transUses should not contain 'unquote'")
+		}
+	}
+}
+
+func TestParseUsingBody_KeywordModuleHints(t *testing.T) {
+	t.Run("Keyword.put_new adds module as transitive use", func(t *testing.T) {
+		text := `defmodule Remote.Oban.Pro.Worker do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
+
+    quote do
+      use Remote.Oban.Worker, unquote(opts)
+    end
+  end
+end`
+		_, _, transUses := parseUsingBody(text)
+		found := false
+		for _, u := range transUses {
+			if u == "Oban.Pro.Worker" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected Oban.Pro.Worker in transUses, got %v", transUses)
+		}
+	})
+
+	t.Run("Keyword.pop default adds module as transitive use", func(t *testing.T) {
+		text := `defmodule MyLib do
+  defmacro __using__(opts) do
+    {mod, opts} = Keyword.pop(opts, :base_module, MyLib.DefaultBase)
+
+    quote do
+      use unquote(mod), unquote(opts)
+    end
+  end
+end`
+		_, _, transUses := parseUsingBody(text)
+		found := false
+		for _, u := range transUses {
+			if u == "MyLib.DefaultBase" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected MyLib.DefaultBase in transUses, got %v", transUses)
+		}
+	})
+
+	t.Run("ignores non-module Keyword defaults", func(t *testing.T) {
+		text := `defmodule MyLib do
+  defmacro __using__(opts) do
+    {flag, opts} = Keyword.pop(opts, :debug, false)
+
+    quote do
+      use MyLib.Base, unquote(opts)
+    end
+  end
+end`
+		_, _, transUses := parseUsingBody(text)
+		for _, u := range transUses {
+			if u == "false" {
+				t.Error("transUses should not contain 'false'")
+			}
+		}
+	})
+}
+
 func TestFindBufferFunctions(t *testing.T) {
 	text := `defmodule Foo do
   def public_one(a) do

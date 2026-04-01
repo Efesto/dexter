@@ -83,9 +83,23 @@ func extractSignature(lines []string, defIdx int) string {
 func extractDocAbove(lines []string, defIdx int) (doc, spec string) {
 	// Scan backward to find the previous function/module boundary so we don't
 	// have to process the entire file — the relevant doc block is always between
-	// the previous definition and this one.
+	// the previous definition and this one. We must skip heredoc content so that
+	// example code inside @doc blocks (e.g. "defmodule MyApp.Worker do") doesn't
+	// get mistaken for a real boundary.
 	start := 0
+	inHeredocBack := false
 	for i := defIdx - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if !inHeredocBack && trimmed == `"""` {
+			inHeredocBack = true
+			continue
+		}
+		if inHeredocBack {
+			if strings.HasSuffix(trimmed, `"""`) {
+				inHeredocBack = false
+			}
+			continue
+		}
 		if parser.FuncDefRe.MatchString(lines[i]) || parser.DefmoduleRe.MatchString(lines[i]) || parser.TypeDefRe.MatchString(lines[i]) {
 			start = i + 1
 			break

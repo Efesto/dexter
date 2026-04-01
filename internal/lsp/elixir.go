@@ -149,7 +149,10 @@ func FindBufferFunctions(text string) []BufferFunction {
 var (
 	aliasMultiRe    = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\.{([^}]+)}`)
 	importRe        = regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`)
+	useRe           = regexp.MustCompile(`^\s*use\s+([A-Za-z0-9_.]+)`)
+	usingDefRe      = regexp.MustCompile(`^\s*defmacro\s+__using__`)
 	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
+	keywordModuleRe = regexp.MustCompile(`Keyword\.(?:put_new|put|pop!?)\([^,]+,\s*:[a-z_]+,\s*([A-Z][A-Za-z0-9_.]+)\)`)
 )
 
 // ExtractAliases parses all alias declarations from document text.
@@ -220,6 +223,135 @@ func ExtractImports(text string) []string {
 		}
 	}
 	return imports
+}
+
+// ExtractUses returns module names from all `use Module` declarations.
+func ExtractUses(text string) []string {
+	var uses []string
+	for _, line := range strings.Split(text, "\n") {
+		if m := useRe.FindStringSubmatch(line); m != nil {
+			uses = append(uses, m[1])
+		}
+	}
+	return uses
+}
+
+// inlineDef records a function or macro defined directly inside a __using__
+// quote do block. These definitions get injected into any module that `use`s
+// the parent module.
+type inlineDef struct {
+	line  int // 1-based line number in the source file
+	arity int
+	kind  string // "def", "defp", "defmacro", etc.
+}
+
+// extractUsingImports returns the modules imported within the defmacro __using__
+// body, with file-level aliases resolved. Results are in source order; callers
+// should iterate in reverse to respect "last import wins" semantics.
+func extractUsingImports(text string) []string {
+	imported, _, _ := parseUsingBody(text)
+	return imported
+}
+
+// extractUsingInlineDefs returns 1-based line numbers of def/defmacro
+// declarations for functionName inside the defmacro __using__ body.
+func extractUsingInlineDefs(text, functionName string) []int {
+	_, inlineDefs, _ := parseUsingBody(text)
+	var lines []int
+	for _, d := range inlineDefs[functionName] {
+		lines = append(lines, d.line)
+	}
+	return lines
+}
+
+// parseUsingBody finds the defmacro __using__ block in text and scans its body
+// for import statements, inline function definitions, and transitive use calls.
+// Returns imported module names, all inline defs keyed by function name, and
+// module names from `use` statements inside the body (for double-use chains).
+// The full maps are returned so callers can cache them once.
+func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string) {
+	lines := strings.Split(text, "\n")
+	fileAliases := ExtractAliases(text)
+
+	usingIdx := -1
+	usingIndent := 0
+	for i, line := range lines {
+		if usingDefRe.MatchString(line) {
+			usingIdx = i
+			usingIndent = len(line) - len(strings.TrimLeft(line, " \t"))
+			break
+		}
+	}
+	if usingIdx < 0 {
+		return
+	}
+
+	inlineDefs = make(map[string][]inlineDef)
+
+	resolveAlias := func(modName string) string {
+		if resolved, ok := fileAliases[modName]; ok {
+			return resolved
+		}
+		if parts := strings.SplitN(modName, ".", 2); len(parts) == 2 {
+			if resolved, ok := fileAliases[parts[0]]; ok {
+				return resolved + "." + parts[1]
+			}
+		}
+		return modName
+	}
+
+	for i := usingIdx + 1; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		// Stop at another definition or closing end at the same indentation level
+		if indent <= usingIndent && (parser.FuncDefRe.MatchString(line) || trimmed == "end") {
+			break
+		}
+
+		if m := importRe.FindStringSubmatch(line); m != nil {
+			imported = append(imported, resolveAlias(m[1]))
+			continue
+		}
+
+		if m := useRe.FindStringSubmatch(line); m != nil {
+			modName := m[1]
+			// Skip `use unquote(var)` — the module is dynamic and can't be
+			// resolved statically. Module hints from Keyword.put_new/put/pop
+			// below handle the common case.
+			if modName != "unquote" {
+				transUses = append(transUses, resolveAlias(modName))
+			}
+			continue
+		}
+
+		// Detect module names passed through opts via Keyword.put_new/put/pop.
+		// For example: Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
+		// These modules are typically used transitively deeper in the chain
+		// via `use unquote(var)` and can't be resolved statically otherwise.
+		//
+		// This is a bit hacky — it matches any Keyword call with a module
+		// value, not just ones whose variable feeds into a `use unquote(var)`.
+		// A proper fix would link the variable name to the unquote call, but
+		// that requires a two-pass scan. The false positives are harmless
+		// (just extra nil lookups) and the pattern doesn't appear in practice.
+		if m := keywordModuleRe.FindStringSubmatch(line); m != nil {
+			transUses = append(transUses, resolveAlias(m[1]))
+		}
+
+		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
+			funcName := m[2]
+			inlineDefs[funcName] = append(inlineDefs[funcName], inlineDef{
+				line:  i + 1,
+				arity: parser.ExtractArity(line, funcName),
+				kind:  m[1],
+			})
+		}
+	}
+	return
 }
 
 // ExtractModuleAttribute returns the attribute name if the cursor is on a @attr reference,

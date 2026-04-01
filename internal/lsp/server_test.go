@@ -244,6 +244,20 @@ func TestServer_InitializationOptions_FollowDelegates(t *testing.T) {
 	}
 }
 
+func definitionAt(t *testing.T, server *Server, uri string, line, col uint32) []protocol.Location {
+	t.Helper()
+	result, err := server.Definition(context.Background(), &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: line, Character: col},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
 func completionAt(t *testing.T, server *Server, uri string, line, col uint32) []protocol.CompletionItem {
 	t.Helper()
 	result, err := server.Completion(context.Background(), &protocol.CompletionParams{
@@ -942,6 +956,164 @@ end
 	items := completionAt(t, server, uri, 0, 5)
 	if !hasCompletionItem(items, "Enum") {
 		t.Error("expected 'Enum' in module prefix completions")
+	}
+}
+
+func TestCompletion_UseInjectedImport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Index the used module — __using__ imports itself (alias Schema → MyApp.Schema)
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", `defmodule MyApp.Schema do
+  alias MyApp.Schema
+
+  defmacro __using__(_opts) do
+    quote do
+      import Schema
+    end
+  end
+
+  @doc "Defines a schema."
+  defmacro schema(source, do: block) do
+    :ok
+  end
+
+  defmacro embedded_schema(do: block) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Schema
+
+  sch
+end`)
+
+	// col=5 — cursor after "sch" (prefix "sch")
+	items := completionAt(t, server, uri, 3, 5)
+	if !hasCompletionItem(items, "schema") {
+		t.Errorf("expected 'schema' in completions from use-injected import, got %v",
+			func() []string {
+				var labels []string
+				for _, item := range items {
+					labels = append(labels, item.Label)
+				}
+				return labels
+			}())
+	}
+}
+
+func TestCompletion_UseInjectedInlineDef(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/helpers.ex", `defmodule MyApp.Helpers do
+  defmacro __using__(_opts) do
+    quote do
+      def double(x), do: x * 2
+      def triple(x), do: x * 3
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+
+	// "do" prefix — should match double
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Helpers
+
+  do
+end`)
+	items := completionAt(t, server, uri, 3, 4)
+	if !hasCompletionItem(items, "double") {
+		t.Error("expected 'double' in completions from use-injected inline def")
+	}
+
+	// "tr" prefix — should match triple
+	server.docs.Set(uri, `defmodule MyApp.User do
+  use MyApp.Helpers
+
+  tr
+end`)
+	items = completionAt(t, server, uri, 3, 4)
+	if !hasCompletionItem(items, "triple") {
+		t.Error("expected 'triple' in completions from use-injected inline def")
+	}
+}
+
+func TestDefinition_ModuleKeyword(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Accounts do
+  @moduledoc "Manages accounts."
+
+  alias __MODULE__.User
+
+  def get_user(id), do: id
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", src)
+	fileURI := "file://" + filepath.Join(server.projectRoot, "lib/accounts.ex")
+	server.docs.Set(fileURI, src)
+
+	// col=9 is on '__MODULE__' in the alias line (line 3)
+	locs := definitionAt(t, server, fileURI, 3, 9)
+	if len(locs) == 0 {
+		t.Fatal("expected definition for __MODULE__")
+	}
+	if locs[0].Range.Start.Line != 0 {
+		t.Errorf("expected jump to defmodule on line 0, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestDefinition_ModuleKeywordSubmodule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts/user.ex", `defmodule MyApp.Accounts.User do
+  def new, do: %{}
+end`)
+	src := `defmodule MyApp.Accounts do
+  alias __MODULE__.User
+
+  def get_user(id), do: User.new()
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", src)
+	fileURI := "file://" + filepath.Join(server.projectRoot, "lib/accounts.ex")
+	server.docs.Set(fileURI, src)
+
+	// col=20 is on 'User' in alias __MODULE__.User (line 1)
+	locs := definitionAt(t, server, fileURI, 1, 20)
+	if len(locs) == 0 {
+		t.Fatal("expected definition for __MODULE__.User")
+	}
+	if locs[0].Range.Start.Line != 0 {
+		t.Errorf("expected jump to MyApp.Accounts.User defmodule on line 0, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestDefinition_KernelAutoImport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/kernel.ex", `defmodule Kernel do
+  def to_timeout(duration), do: duration
+end`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Worker do
+  def run do
+    to_timeout({:second, 5})
+  end
+end`)
+
+	// col=5 is on 'to_timeout' (line 2)
+	locs := definitionAt(t, server, uri, 2, 5)
+	if len(locs) == 0 {
+		t.Fatal("expected definition for Kernel auto-imported to_timeout")
 	}
 }
 

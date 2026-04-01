@@ -760,6 +760,82 @@ end`)
 	if !strings.Contains(hover.Contents.Value, "args_schema") {
 		t.Errorf("expected args_schema in hover, got %q", hover.Contents.Value)
 	}
+	if !strings.Contains(hover.Contents.Value, "Defines the argument schema") {
+		t.Errorf("expected doc content in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_DocSinceBeforeDef(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Mirrors Oban.Pro.Worker's exact structure: __using__ body with inline defs
+	// and @doc false, then @doc heredoc + @doc since: before the target defmacro
+	indexFile(t, server.store, server.projectRoot, "lib/pro_worker.ex", `defmodule Oban.Pro.Worker do
+  defmacro __using__(_opts) do
+    quote do
+      import Oban.Pro.Worker, only: [args_schema: 1]
+
+      @doc false
+      def __verify_stages__(module), do: module.__stages__()
+
+      @doc false
+      def __stages__ do
+        :ok
+      end
+
+      def __opts__, do: []
+
+      def new(args, opts \\ []), do: :ok
+
+      def backoff(job), do: :ok
+
+      def timeout(job), do: :ok
+
+      def perform(job), do: :ok
+
+      def fetch_recorded(job), do: :ok
+
+      defoverridable backoff: 1, new: 2, perform: 1, timeout: 1
+    end
+  end
+
+  @doc """
+  Define an args schema struct with field definitions.
+
+  ## Example
+
+      defmodule MyApp.Worker do
+        use Oban.Pro.Worker
+
+        args_schema do
+          field :id, :id, required: true
+        end
+      end
+  """
+  @doc since: "0.14.0"
+  defmacro args_schema(do: _block) do
+    quote do: :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Worker do
+  use Oban.Pro.Worker
+
+  args_schema do
+    :ok
+  end
+end`)
+
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for args_schema with @doc since:")
+	}
+	if !strings.Contains(hover.Contents.Value, "Define an args schema struct") {
+		t.Errorf("expected doc content before @doc since:, got %q", hover.Contents.Value)
+	}
 }
 
 func TestHover_SigilHeredoc(t *testing.T) {

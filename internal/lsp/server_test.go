@@ -1095,6 +1095,28 @@ end`
 	}
 }
 
+func TestDefinition_KernelAutoImport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/kernel.ex", `defmodule Kernel do
+  def to_timeout(duration), do: duration
+end`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Worker do
+  def run do
+    to_timeout({:second, 5})
+  end
+end`)
+
+	// col=5 is on 'to_timeout' (line 2)
+	locs := definitionAt(t, server, uri, 2, 5)
+	if len(locs) == 0 {
+		t.Fatal("expected definition for Kernel auto-imported to_timeout")
+	}
+}
+
 func TestDetectElixirStdlibRoot(t *testing.T) {
 	root, ok := stdlib.DetectElixirLibRoot()
 	if !ok {

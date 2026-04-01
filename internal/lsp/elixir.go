@@ -152,6 +152,7 @@ var (
 	useRe           = regexp.MustCompile(`^\s*use\s+([A-Za-z0-9_.]+)`)
 	usingDefRe      = regexp.MustCompile(`^\s*defmacro\s+__using__`)
 	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
+	keywordModuleRe = regexp.MustCompile(`Keyword\.(?:put_new|put|pop!?)\([^,]+,\s*:[a-z_]+,\s*([A-Z][A-Za-z0-9_.]+)\)`)
 )
 
 // ExtractAliases parses all alias declarations from document text.
@@ -317,8 +318,22 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		}
 
 		if m := useRe.FindStringSubmatch(line); m != nil {
-			transUses = append(transUses, resolveAlias(m[1]))
+			modName := m[1]
+			// Skip `use unquote(var)` — the module is dynamic and can't be
+			// resolved statically. Module hints from Keyword.put_new/put/pop
+			// below handle the common case.
+			if modName != "unquote" {
+				transUses = append(transUses, resolveAlias(modName))
+			}
 			continue
+		}
+
+		// Detect module names passed through opts via Keyword.put_new/put/pop.
+		// For example: Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
+		// These modules are typically used transitively deeper in the chain
+		// via `use unquote(var)` and can't be resolved statically otherwise.
+		if m := keywordModuleRe.FindStringSubmatch(line); m != nil {
+			transUses = append(transUses, resolveAlias(m[1]))
 		}
 
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {

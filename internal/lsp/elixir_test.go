@@ -750,6 +750,88 @@ end`
 	check("my_macro", 1, "defmacro")
 }
 
+func TestParseUsingBody_SkipsUnquoteUse(t *testing.T) {
+	text := `defmodule Remote.Oban.Worker do
+  defmacro __using__(opts) do
+    {oban_module, opts} = Keyword.pop(opts, :oban_module, Oban.Worker)
+
+    quote do
+      use unquote(oban_module), unquote(opts)
+    end
+  end
+end`
+	_, _, transUses := parseUsingBody(text)
+	for _, u := range transUses {
+		if u == "unquote" {
+			t.Error("transUses should not contain 'unquote'")
+		}
+	}
+}
+
+func TestParseUsingBody_KeywordModuleHints(t *testing.T) {
+	t.Run("Keyword.put_new adds module as transitive use", func(t *testing.T) {
+		text := `defmodule Remote.Oban.Pro.Worker do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
+
+    quote do
+      use Remote.Oban.Worker, unquote(opts)
+    end
+  end
+end`
+		_, _, transUses := parseUsingBody(text)
+		found := false
+		for _, u := range transUses {
+			if u == "Oban.Pro.Worker" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected Oban.Pro.Worker in transUses, got %v", transUses)
+		}
+	})
+
+	t.Run("Keyword.pop default adds module as transitive use", func(t *testing.T) {
+		text := `defmodule MyLib do
+  defmacro __using__(opts) do
+    {mod, opts} = Keyword.pop(opts, :base_module, MyLib.DefaultBase)
+
+    quote do
+      use unquote(mod), unquote(opts)
+    end
+  end
+end`
+		_, _, transUses := parseUsingBody(text)
+		found := false
+		for _, u := range transUses {
+			if u == "MyLib.DefaultBase" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected MyLib.DefaultBase in transUses, got %v", transUses)
+		}
+	})
+
+	t.Run("ignores non-module Keyword defaults", func(t *testing.T) {
+		text := `defmodule MyLib do
+  defmacro __using__(opts) do
+    {flag, opts} = Keyword.pop(opts, :debug, false)
+
+    quote do
+      use MyLib.Base, unquote(opts)
+    end
+  end
+end`
+		_, _, transUses := parseUsingBody(text)
+		for _, u := range transUses {
+			if u == "false" {
+				t.Error("transUses should not contain 'false'")
+			}
+		}
+	})
+}
+
 func TestFindBufferFunctions(t *testing.T) {
 	text := `defmodule Foo do
   def public_one(a) do

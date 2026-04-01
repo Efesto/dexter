@@ -702,6 +702,66 @@ end`)
 	}
 }
 
+func TestHover_TripleUseChain_DynamicModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Base layer: defines args_schema macro and imports it in __using__
+	indexFile(t, server.store, server.projectRoot, "lib/pro_worker.ex", `defmodule Oban.Pro.Worker do
+  defmacro __using__(_opts) do
+    quote do
+      import Oban.Pro.Worker, only: [args_schema: 1]
+    end
+  end
+
+  @doc "Defines the argument schema."
+  defmacro args_schema(do: _block) do
+    quote do: :ok
+  end
+end
+`)
+	// Middle layer: uses a dynamic module via unquote(oban_module)
+	indexFile(t, server.store, server.projectRoot, "lib/oban_worker.ex", `defmodule Remote.Oban.Worker do
+  defmacro __using__(opts) do
+    {oban_module, opts} = Keyword.pop(opts, :oban_module, Oban.Worker)
+
+    quote do
+      use unquote(oban_module), unquote(opts)
+    end
+  end
+end
+`)
+	// Top layer: sets oban_module to Oban.Pro.Worker via Keyword.put_new
+	indexFile(t, server.store, server.projectRoot, "lib/pro_wrapper.ex", `defmodule Remote.Oban.Pro.Worker do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
+
+    quote do
+      use Remote.Oban.Worker, unquote(opts)
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.FileWorker do
+  use Remote.Oban.Pro.Worker, owner: :my_team, queue: :default
+
+  args_schema do
+    field :employer_id, :id, required: true
+  end
+end`)
+
+	// col=2 is on 'a' of "args_schema"
+	hover := hoverAt(t, server, uri, 3, 2)
+	if hover == nil {
+		t.Fatal("expected hover for triple-use-chain with dynamic module")
+	}
+	if !strings.Contains(hover.Contents.Value, "args_schema") {
+		t.Errorf("expected args_schema in hover, got %q", hover.Contents.Value)
+	}
+}
+
 func TestHover_SigilHeredoc(t *testing.T) {
 	src := `defmodule MyApp.Users do
   @doc ~S"""

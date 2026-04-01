@@ -419,6 +419,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			return storeResultsToLocations(results), nil
 		}
 
+		// Kernel is always imported — fall back to it last
+		if results, err := s.store.LookupFollowDelegate("Kernel", functionName); err == nil && len(results) > 0 {
+			return storeResultsToLocations(results), nil
+		}
+
 		return nil, nil
 	}
 
@@ -1085,6 +1090,11 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 
 		// Check use-injected imports and inline defs
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
+			return s.hoverFromFile(functionName, results[0])
+		}
+
+		// Kernel is always imported — fall back to it last
+		if results, err := s.store.LookupFollowDelegate("Kernel", functionName); err == nil && len(results) > 0 {
 			return s.hoverFromFile(functionName, results[0])
 		}
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] - 2026-04-01
+
+### Added
+
+- **Hover documentation** — hovering over a module or function now displays its `@moduledoc`/`@doc` content, rendered as Markdown
+- **Autocompletion** — module and function completions with documentation shown inline, including support for already-aliased modules and local functions
+- **Elixir standard library support** — hover docs and completions now cover Elixir stdlib modules (e.g. `Enum`, `Map`, `String`) and `@typedoc` content
+- **`use` macro support** — go-to-definition and hover now work on `use` statements, including complex multi-part module names like `Remote.Oban.Pro.Worker`
+- **`__MODULE__` support** — go-to-definition and hover resolve `__MODULE__` references correctly
+- **Zed editor support** — added configuration instructions for Zed
+
+### Changed
+
+- **File watching** — the LSP server now watches for external file changes (e.g. branch switches, `git pull`) and automatically refreshes the index, beyond the existing Git HEAD polling
+- **Full reindex on version bumps** — when a new version of Dexter requires schema changes, the index is rebuilt entirely on startup instead of attempting an incremental update
+- **CI pipeline** — added GitLab CI with linting and tests
+
 ## [0.3.0] - 2026-03-31
 
 ### Changed

@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -25,6 +27,7 @@ func main() {
 	}
 
 	var force bool
+	var profile bool
 	initCmd := &cobra.Command{
 		Use:   "init [path]",
 		Short: "Full index of an Elixir project",
@@ -34,11 +37,12 @@ func main() {
 			if err != nil {
 				return err
 			}
-			cmdInit(projectRoot, force)
+			cmdInit(projectRoot, force, profile)
 			return nil
 		},
 	}
 	initCmd.Flags().BoolVar(&force, "force", false, "Delete and rebuild index from scratch")
+	initCmd.Flags().BoolVar(&profile, "profile", false, "Print timing breakdown for each phase")
 
 	reindexCmd := &cobra.Command{
 		Use:   "reindex [file|path]",
@@ -140,7 +144,7 @@ func findProjectRoot(path string) string {
 	return path
 }
 
-func cmdInit(projectRoot string, force bool) {
+func cmdInit(projectRoot string, force bool, profile bool) {
 	dbPath := filepath.Join(projectRoot, ".dexter.db")
 	if _, err := os.Stat(dbPath); err == nil {
 		if !force {
@@ -163,70 +167,116 @@ func cmdInit(projectRoot string, force bool) {
 		}
 	}()
 
+	prof := &profiler{enabled: profile}
 	start := time.Now()
 
-	// Phase 1: collect file paths
-	var paths []string
-	err = parser.WalkElixirFiles(projectRoot, func(path string, info os.FileInfo) error {
-		paths = append(paths, path)
+	// Phase 1: collect file paths and mtimes
+	type fileEntry struct {
+		path      string
+		mtimeNano int64
+	}
+	var files []fileEntry
+	err = parser.WalkElixirFiles(projectRoot, func(path string, d fs.DirEntry) error {
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		files = append(files, fileEntry{path: path, mtimeNano: info.ModTime().UnixNano()})
 		return nil
 	})
 	if err != nil {
 		fatal(err)
 	}
 	if stdlibRoot, ok := stdlib.Resolve(s, ""); ok {
-		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, info os.FileInfo) error {
-			paths = append(paths, path)
+		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, d fs.DirEntry) error {
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			files = append(files, fileEntry{path: path, mtimeNano: info.ModTime().UnixNano()})
 			return nil
 		})
 	}
+	prof.log("  walk: %s (%d files)\n", prof.since(start).Round(time.Millisecond), len(files))
 
 	// Phase 2: parse in parallel
 	type parseResult struct {
-		path string
-		defs []parser.Definition
+		path      string
+		mtimeNano int64
+		defs      []parser.Definition
 	}
 
 	workers := runtime.NumCPU()
-	pathCh := make(chan string, workers)
-	resultCh := make(chan parseResult, workers)
+	fileCh := make(chan fileEntry, workers)
+	resultCh := make(chan parseResult, 1024)
 
+	var parseNanos atomic.Int64
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for path := range pathCh {
-				defs, err := parser.ParseFile(path)
+			for f := range fileCh {
+				t0 := prof.now()
+				defs, err := parser.ParseFile(f.path)
+				parseNanos.Add(int64(prof.since(t0)))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", path, err)
+					fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", f.path, err)
 					continue
 				}
-				resultCh <- parseResult{path: path, defs: defs}
+				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs}
 			}
 		}()
 	}
 
 	go func() {
-		for _, p := range paths {
-			pathCh <- p
+		for _, f := range files {
+			fileCh <- f
 		}
-		close(pathCh)
+		close(fileCh)
 		wg.Wait()
 		close(resultCh)
 	}()
 
-	// Phase 3: batch write to SQLite (single writer)
+	// Phase 3: bulk insert to SQLite (single writer, single transaction, no indexes)
+	pipelineStart := prof.now()
+	if err := s.DropDefinitionIndexes(); err != nil {
+		fatal(err)
+	}
+	batch, err := s.BeginBulkInsert()
+	if err != nil {
+		fatal(err)
+	}
 	count := 0
 	defCount := 0
+	var writeNanos int64
 	for res := range resultCh {
-		if err := s.IndexFile(res.path, res.defs); err != nil {
+		t0 := prof.now()
+		if err := batch.IndexFileWithMtime(res.path, res.mtimeNano, res.defs); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", res.path, err)
 			continue
 		}
+		writeNanos += int64(prof.since(t0))
 		count++
 		defCount += len(res.defs)
 	}
+	prof.log("  parse+write: %s (parse: %s across %d workers, write: %s)\n",
+		prof.since(pipelineStart).Round(time.Millisecond),
+		time.Duration(parseNanos.Load()).Round(time.Millisecond),
+		workers,
+		time.Duration(writeNanos).Round(time.Millisecond))
+
+	commitStart := prof.now()
+	if err := batch.Commit(); err != nil {
+		fatal(err)
+	}
+	prof.log("  commit: %s\n", prof.since(commitStart).Round(time.Millisecond))
+
+	indexStart := prof.now()
+	if err := s.CreateDefinitionIndexes(); err != nil {
+		fatal(err)
+	}
+	prof.log("  create indexes: %s\n", prof.since(indexStart).Round(time.Millisecond))
 
 	if err := s.SetIndexVersion(version.IndexVersion); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to store index version: %v\n", err)
@@ -260,7 +310,7 @@ func cmdReindex(target string) {
 	if stored := s.GetIndexVersion(); stored != version.IndexVersion {
 		fmt.Fprintf(os.Stderr, "Index version mismatch (stored: %d, current: %d), performing full rebuild...\n", stored, version.IndexVersion)
 		closeStore()
-		cmdInit(projectRoot, true)
+		cmdInit(projectRoot, true, false)
 		return
 	}
 
@@ -273,9 +323,13 @@ func cmdReindex(target string) {
 	reindexed := 0
 	skipped := 0
 
-	walkFn := func(path string, fi os.FileInfo) error {
+	walkFn := func(path string, d fs.DirEntry) error {
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
 		storedMtime, found := s.GetFileMtime(path)
-		currentMtime := fi.ModTime().UnixNano()
+		currentMtime := info.ModTime().UnixNano()
 		if found && storedMtime == currentMtime {
 			skipped++
 			return nil
@@ -368,7 +422,7 @@ func cmdLSP(projectRoot string) {
 		if err := s.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
 		}
-		cmdInit(projectRoot, true)
+		cmdInit(projectRoot, true, false)
 		s, err = store.Open(projectRoot)
 		if err != nil {
 			fatal(err)
@@ -391,4 +445,28 @@ func cmdLSP(projectRoot string) {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(1)
+}
+
+type profiler struct {
+	enabled bool
+}
+
+func (p *profiler) now() time.Time {
+	if !p.enabled {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+func (p *profiler) since(start time.Time) time.Duration {
+	if !p.enabled {
+		return 0
+	}
+	return time.Since(start)
+}
+
+func (p *profiler) log(format string, args ...interface{}) {
+	if p.enabled {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
 }

@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,12 +18,9 @@ var (
 
 var (
 	DefmoduleRe    = regexp.MustCompile(`^\s*defmodule\s+([A-Za-z0-9_.]+)\s+do`)
-	defprotocolRe  = regexp.MustCompile(`^\s*defprotocol\s+([A-Za-z0-9_.]+)\s+do`)
-	defimplRe      = regexp.MustCompile(`^\s*defimpl\s+([A-Za-z0-9_.]+)`)
-	defstructRe    = regexp.MustCompile(`^\s*defstruct\s`)
-	defexceptionRe = regexp.MustCompile(`^\s*defexception\s`)
 	delegateToRe   = regexp.MustCompile(`to:\s*([A-Za-z0-9_.]+)`)
 	delegateAsRe   = regexp.MustCompile(`as:\s*:?([a-z_][a-z0-9_?!]*)`)
+	newStatementRe = regexp.MustCompile(`^\s*(defdelegate|defp?|defmacrop?|defguardp?|alias|import|@|end)\b`)
 )
 
 type Definition struct {
@@ -55,26 +53,48 @@ func ParseFile(path string) ([]Definition, error) {
 
 	for lineIdx, line := range lines {
 		lineNum := lineIdx + 1
-		trimmed := strings.TrimSpace(line)
 
-		quoteCount := strings.Count(line, `"""`)
-		if quoteCount > 0 {
-			if quoteCount >= 2 {
+		// Heredoc tracking — only scan for """ if line contains a double-quote
+		if strings.IndexByte(line, '"') >= 0 {
+			quoteCount := strings.Count(line, `"""`)
+			if quoteCount > 0 {
+				if quoteCount >= 2 {
+					continue
+				}
+				inHeredoc = !inHeredoc
 				continue
 			}
-			inHeredoc = !inHeredoc
-			continue
 		}
 
 		if inHeredoc {
 			continue
 		}
 
-		if trimmed == "end" && len(moduleStack) > 0 {
-			indent := len(line) - len(strings.TrimLeft(line, " \t"))
-			if moduleStack[len(moduleStack)-1].indent == indent {
-				moduleStack = moduleStack[:len(moduleStack)-1]
+		// Find first non-whitespace character for fast pre-filtering.
+		// All patterns we match start with a keyword: def*, alias, @type, or end.
+		trimStart := 0
+		for trimStart < len(line) && (line[trimStart] == ' ' || line[trimStart] == '\t') {
+			trimStart++
+		}
+		if trimStart >= len(line) {
+			continue
+		}
+		first := line[trimStart]
+		rest := line[trimStart:] // line content from first non-whitespace char
+
+		// 'e' — check for "end" to pop module stack
+		if first == 'e' {
+			if len(moduleStack) > 0 && strings.TrimRight(rest, " \t\r") == "end" {
+				if moduleStack[len(moduleStack)-1].indent == trimStart {
+					moduleStack = moduleStack[:len(moduleStack)-1]
+				}
 			}
+			continue
+		}
+
+		// Skip lines that can't match any pattern we care about
+		if first != 'a' && first != 'd' && first != '@' {
+			continue
 		}
 
 		currentModule := ""
@@ -82,36 +102,88 @@ func ParseFile(path string) ([]Definition, error) {
 			currentModule = moduleStack[len(moduleStack)-1].name
 		}
 
-		// Track aliases, resolving __MODULE__ to the current module name
-		resolveModule := func(s string) string {
-			if currentModule != "" {
-				return strings.ReplaceAll(s, "__MODULE__", currentModule)
+		// 'a' — alias tracking
+		if first == 'a' {
+			if !strings.HasPrefix(rest, "alias") || (len(rest) > 5 && rest[5] != ' ' && rest[5] != '\t') {
+				continue
 			}
-			return s
-		}
-		if m := AliasAsRe.FindStringSubmatch(line); m != nil {
-			resolved := resolveModule(m[1])
-			// Skip if we can't resolve __MODULE__ (no current module yet)
-			if !strings.Contains(resolved, "__MODULE__") {
-				aliases[m[2]] = resolved
+			resolveModule := func(s string) string {
+				if currentModule != "" {
+					return strings.ReplaceAll(s, "__MODULE__", currentModule)
+				}
+				return s
 			}
-		} else if m := AliasRe.FindStringSubmatch(line); m != nil {
-			resolved := resolveModule(m[1])
-			parts := strings.Split(resolved, ".")
-			shortName := parts[len(parts)-1]
-			aliases[shortName] = resolved
+			afterAlias := strings.TrimLeft(rest[5:], " \t")
+			moduleName := scanModuleName(afterAlias)
+			if moduleName == "" {
+				continue
+			}
+			// Check for ", as:" pattern
+			remaining := afterAlias[len(moduleName):]
+			remaining = strings.TrimLeft(remaining, " \t")
+			if strings.HasPrefix(remaining, ", as:") || strings.HasPrefix(remaining, ",as:") {
+				asStr := remaining[strings.Index(remaining, "as:")+3:]
+				asStr = strings.TrimLeft(asStr, " \t")
+				asName := scanIdentifier(asStr)
+				if asName != "" {
+					resolved := resolveModule(moduleName)
+					if !strings.Contains(resolved, "__MODULE__") {
+						aliases[asName] = resolved
+					}
+				}
+			} else {
+				resolved := resolveModule(moduleName)
+				parts := strings.Split(resolved, ".")
+				shortName := parts[len(parts)-1]
+				aliases[shortName] = resolved
+			}
+			continue
 		}
 
-		if m := DefmoduleRe.FindStringSubmatch(line); m != nil {
-			name := m[1]
-			// A single-segment name (no dots) nested inside another module is
-			// relative: defmodule Foo inside defmodule Bar becomes Bar.Foo
+		// '@' — type definitions (@type, @typep, @opaque)
+		if first == '@' {
+			if currentModule == "" {
+				continue
+			}
+			var kind string
+			var afterKw string
+			if strings.HasPrefix(rest, "@typep") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
+				kind = "typep"
+				afterKw = strings.TrimLeft(rest[6:], " \t")
+			} else if strings.HasPrefix(rest, "@type") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
+				kind = "type"
+				afterKw = strings.TrimLeft(rest[5:], " \t")
+			} else if strings.HasPrefix(rest, "@opaque") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t') {
+				kind = "opaque"
+				afterKw = strings.TrimLeft(rest[7:], " \t")
+			} else {
+				continue
+			}
+			name := scanFuncName(afterKw)
+			if name != "" {
+				defs = append(defs, Definition{
+					Module:   currentModule,
+					Function: name,
+					Arity:    ExtractArity(line, name),
+					Line:     lineNum,
+					FilePath: path,
+					Kind:     kind,
+				})
+			}
+			continue
+		}
+
+		// 'd' — defmodule, defprotocol, defimpl, def*, defstruct, defexception
+		if !strings.HasPrefix(rest, "def") {
+			continue
+		}
+
+		if name, ok := scanDefKeyword(rest, "defmodule"); ok {
 			if !strings.Contains(name, ".") && currentModule != "" {
 				name = currentModule + "." + name
 			}
 			currentModule = name
-			indent := len(line) - len(strings.TrimLeft(line, " \t"))
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: indent})
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -121,10 +193,9 @@ func ParseFile(path string) ([]Definition, error) {
 			continue
 		}
 
-		if m := defprotocolRe.FindStringSubmatch(line); m != nil {
-			currentModule = m[1]
-			indent := len(line) - len(strings.TrimLeft(line, " \t"))
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: indent})
+		if name, ok := scanDefKeyword(rest, "defprotocol"); ok {
+			currentModule = name
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -134,10 +205,9 @@ func ParseFile(path string) ([]Definition, error) {
 			continue
 		}
 
-		if m := defimplRe.FindStringSubmatch(line); m != nil {
-			currentModule = m[1]
-			indent := len(line) - len(strings.TrimLeft(line, " \t"))
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: indent})
+		if name, ok := scanDefKeyword(rest, "defimpl"); ok {
+			currentModule = name
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -148,21 +218,7 @@ func ParseFile(path string) ([]Definition, error) {
 		}
 
 		if currentModule != "" {
-			if m := TypeDefRe.FindStringSubmatch(line); m != nil {
-				defs = append(defs, Definition{
-					Module:   currentModule,
-					Function: m[2],
-					Arity:    ExtractArity(line, m[2]),
-					Line:     lineNum,
-					FilePath: path,
-					Kind:     m[1],
-				})
-				continue
-			}
-
-			if m := FuncDefRe.FindStringSubmatch(line); m != nil {
-				kind := m[1]
-				funcName := m[2]
+			if kind, funcName, ok := scanFuncDef(rest); ok {
 				def := Definition{
 					Module:   currentModule,
 					Function: funcName,
@@ -178,7 +234,7 @@ func ParseFile(path string) ([]Definition, error) {
 				continue
 			}
 
-			if defstructRe.MatchString(line) {
+			if strings.HasPrefix(rest, "defstruct ") || strings.HasPrefix(rest, "defstruct\t") {
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Function: "__struct__",
@@ -187,7 +243,7 @@ func ParseFile(path string) ([]Definition, error) {
 					Kind:     "defstruct",
 				})
 			}
-			if defexceptionRe.MatchString(line) {
+			if strings.HasPrefix(rest, "defexception ") || strings.HasPrefix(rest, "defexception\t") {
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Function: "__exception__",
@@ -202,6 +258,128 @@ func ParseFile(path string) ([]Definition, error) {
 	return defs, nil
 }
 
+// scanModuleName reads a module name ([A-Za-z0-9_.]+) from the start of s.
+func scanModuleName(s string) string {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' {
+			i++
+		} else {
+			break
+		}
+	}
+	if i == 0 {
+		return ""
+	}
+	return s[:i]
+}
+
+// scanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.
+func scanFuncName(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	c := s[0]
+	if (c < 'a' || c > 'z') && c != '_' {
+		return ""
+	}
+	i := 1
+	for i < len(s) {
+		c = s[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '?' || c == '!' {
+			i++
+		} else {
+			break
+		}
+	}
+	return s[:i]
+}
+
+// scanIdentifier reads an identifier ([A-Za-z0-9_]+) from the start of s.
+func scanIdentifier(s string) string {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
+			i++
+		} else {
+			break
+		}
+	}
+	if i == 0 {
+		return ""
+	}
+	return s[:i]
+}
+
+// scanDefKeyword checks if rest starts with keyword (e.g. "defmodule") followed
+// by whitespace and a module name. For defmodule/defprotocol, requires " do" after.
+func scanDefKeyword(rest, keyword string) (string, bool) {
+	if !strings.HasPrefix(rest, keyword) {
+		return "", false
+	}
+	after := rest[len(keyword):]
+	if len(after) == 0 || (after[0] != ' ' && after[0] != '\t') {
+		return "", false
+	}
+	after = strings.TrimLeft(after, " \t")
+	name := scanModuleName(after)
+	if name == "" {
+		return "", false
+	}
+	if keyword == "defimpl" {
+		return name, true
+	}
+	remaining := strings.TrimLeft(after[len(name):], " \t")
+	if remaining == "do" || strings.HasPrefix(remaining, "do ") || strings.HasPrefix(remaining, "do\t") || strings.HasPrefix(remaining, "do\r") {
+		return name, true
+	}
+	return "", false
+}
+
+// funcDefKeywords is ordered longest-first to avoid prefix ambiguity
+// (e.g. "defmacrop" before "defmacro", "defp" before "def").
+var funcDefKeywords = []string{
+	"defdelegate",
+	"defmacrop",
+	"defmacro",
+	"defguardp",
+	"defguard",
+	"defp",
+	"def",
+}
+
+// scanFuncDef checks if rest matches a function definition keyword followed by
+// whitespace and a function name. Returns the kind, name, and true if matched.
+func scanFuncDef(rest string) (string, string, bool) {
+	for _, kw := range funcDefKeywords {
+		if !strings.HasPrefix(rest, kw) {
+			continue
+		}
+		after := rest[len(kw):]
+		// Must be followed by whitespace
+		if len(after) == 0 || (after[0] != ' ' && after[0] != '\t') {
+			continue
+		}
+		after = strings.TrimLeft(after, " \t")
+		name := scanFuncName(after)
+		if name == "" {
+			continue
+		}
+		// Verify next char is whitespace, '(', or ','
+		afterName := after[len(name):]
+		if len(afterName) > 0 {
+			c := afterName[0]
+			if c != ' ' && c != '\t' && c != '(' && c != ',' && c != '\n' && c != '\r' {
+				continue
+			}
+		}
+		return kw, name, true
+	}
+	return "", "", false
+}
+
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,
 // then resolves it via aliases.
 func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string, currentModule string) (string, string) {
@@ -209,9 +387,6 @@ func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string
 	if end > len(lines) {
 		end = len(lines)
 	}
-
-	// Matches a line that starts a new top-level statement — scanning must stop here.
-	newStatementRe := regexp.MustCompile(`^\s*(defdelegate|defp?|defmacrop?|defguardp?|alias|import|@|end)\b`)
 
 	var targetModule, targetFunc string
 	for i := startIdx; i < end; i++ {
@@ -299,12 +474,12 @@ func IsElixirFile(path string) bool {
 
 // WalkElixirFiles walks root, skipping _build/.git/node_modules directories,
 // and calls fn for each .ex/.exs file found.
-func WalkElixirFiles(root string, fn func(path string, info os.FileInfo) error) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if info.IsDir() {
+		if d.IsDir() {
 			base := filepath.Base(path)
 			if base == "_build" || base == ".git" || base == "node_modules" {
 				return filepath.SkipDir
@@ -314,6 +489,6 @@ func WalkElixirFiles(root string, fn func(path string, info os.FileInfo) error) 
 		if !IsElixirFile(path) {
 			return nil
 		}
-		return fn(path, info)
+		return fn(path, d)
 	})
 }

@@ -476,6 +476,162 @@ end
 	}
 }
 
+func TestBatchIndexMultipleFiles(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	pathA := writeElixirFile(t, dir, "lib/alpha.ex", `defmodule MyApp.Alpha do
+  def run do
+    :ok
+  end
+end
+`)
+	pathB := writeElixirFile(t, dir, "lib/beta.ex", `defmodule MyApp.Bravo do
+  def start(arg) do
+    :ok
+  end
+
+  def stop do
+    :ok
+  end
+end
+`)
+
+	defsA, err := parser.ParseFile(pathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defsB, err := parser.ParseFile(pathB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	batch, err := s.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFile(pathA, defsA); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFile(pathB, defsB); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both modules should be queryable
+	results, err := s.LookupModule("MyApp.Alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for Alpha, got %d", len(results))
+	}
+
+	results, err = s.LookupFunction("MyApp.Bravo", "start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for Beta.start, got %d", len(results))
+	}
+
+	// Mtime should be tracked for both files
+	_, found := s.GetFileMtime(pathA)
+	if !found {
+		t.Error("expected mtime for pathA")
+	}
+	_, found = s.GetFileMtime(pathB)
+	if !found {
+		t.Error("expected mtime for pathB")
+	}
+}
+
+func TestBatchIndexFileWithMtime(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/delta.ex", `defmodule MyApp.Delta do
+  def ping do
+    :pong
+  end
+end
+`)
+
+	defs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedMtime := int64(1234567890)
+	batch, err := s.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFileWithMtime(path, expectedMtime, defs); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Definitions should be queryable
+	results, err := s.LookupModule("MyApp.Delta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for Delta, got %d", len(results))
+	}
+
+	// Mtime should be the value we passed, not from os.Stat
+	mtime, found := s.GetFileMtime(path)
+	if !found {
+		t.Fatal("expected mtime to be tracked")
+	}
+	if mtime != expectedMtime {
+		t.Errorf("expected mtime %d, got %d", expectedMtime, mtime)
+	}
+}
+
+func TestBatchRollback(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/gamma.ex", `defmodule MyApp.Golf do
+  def hello do
+    :ok
+  end
+end
+`)
+
+	defs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	batch, err := s.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing should have been persisted
+	results, err := s.LookupModule("MyApp.Golf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Errorf("expected 0 results after rollback, got %d", len(results))
+	}
+}
+
 func TestStdlibRoot(t *testing.T) {
 	s, _ := setupTestStore(t)
 	defer func() { _ = s.Close() }()

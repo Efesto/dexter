@@ -1399,6 +1399,79 @@ end
 	}
 }
 
+func TestParseFile_TrailingWhitespaceOnEnd(t *testing.T) {
+	// "end" with trailing whitespace must still pop the module stack,
+	// otherwise the next module's definitions get lost.
+	path := writeTempFile(t, "defmodule MyApp.Foxtrot do\n  def alpha do\n    :ok\n  end\nend   \n\ndefmodule MyApp.Sierra do\n  def beta do\n    :ok\n  end\nend\n")
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var modules []string
+	for _, d := range defs {
+		if d.Kind == "module" {
+			modules = append(modules, d.Module)
+		}
+	}
+	if len(modules) != 2 || modules[0] != "MyApp.Foxtrot" || modules[1] != "MyApp.Sierra" {
+		t.Errorf("expected [MyApp.Foxtrot, MyApp.Sierra], got %v", modules)
+	}
+
+	found := false
+	for _, d := range defs {
+		if d.Module == "MyApp.Sierra" && d.Function == "beta" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected to find MyApp.Sierra.beta")
+	}
+}
+
+func TestParseFile_ExtraWhitespaceBeforeDo(t *testing.T) {
+	path := writeTempFile(t, "defmodule  MyApp.Echo  do\n  def run do\n    :ok\n  end\nend\n")
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 2 {
+		t.Fatalf("expected 2 definitions, got %d", len(defs))
+	}
+	if defs[0].Module != "MyApp.Echo" || defs[0].Kind != "module" {
+		t.Errorf("unexpected module def: %+v", defs[0])
+	}
+}
+
+func TestParseFile_TabSeparatedKeywords(t *testing.T) {
+	path := writeTempFile(t, "defmodule\tMyApp.Tango\tdo\n\tdef\tmeow(arg) do\n\t\t:ok\n\tend\n\t@type\tname :: String.t()\nend\n")
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var moduleFound, funcFound, typeFound bool
+	for _, d := range defs {
+		switch {
+		case d.Kind == "module" && d.Module == "MyApp.Tango":
+			moduleFound = true
+		case d.Function == "meow" && d.Kind == "def":
+			funcFound = true
+		case d.Function == "name" && d.Kind == "type":
+			typeFound = true
+		}
+	}
+	if !moduleFound {
+		t.Error("expected to find module MyApp.Tango")
+	}
+	if !funcFound {
+		t.Error("expected to find def meow")
+	}
+	if !typeFound {
+		t.Error("expected to find @type name")
+	}
+}
+
 func TestParseFile_TypesNotIndexedOutsideModule(t *testing.T) {
 	// @type at the top level (outside a defmodule) should not be indexed.
 	path := writeTempFile(t, `@type orphan :: integer()

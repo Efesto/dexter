@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -104,10 +105,14 @@ func (s *Server) backgroundReindex() {
 
 		seen := make(map[string]struct{})
 		walkAndIndex := func(root string) {
-			_ = parser.WalkElixirFiles(root, func(path string, info os.FileInfo) error {
+			_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
 				seen[path] = struct{}{}
 
 				if !isEmpty {
+					info, err := d.Info()
+					if err != nil {
+						return nil
+					}
 					storedMtime, found := s.store.GetFileMtime(path)
 					currentMtime := info.ModTime().UnixNano()
 					if found && storedMtime == currentMtime {

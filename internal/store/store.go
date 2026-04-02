@@ -57,12 +57,37 @@ func migrate(db *sql.DB) error {
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+	`)
+	if err != nil {
+		return err
+	}
+	return createDefinitionIndexes(db)
+}
 
+type dbExecer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+func createDefinitionIndexes(db dbExecer) error {
+	_, err := db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_definitions_module ON definitions(module);
 		CREATE INDEX IF NOT EXISTS idx_definitions_module_function ON definitions(module, function);
 		CREATE INDEX IF NOT EXISTS idx_definitions_file_path ON definitions(file_path);
 	`)
 	return err
+}
+
+func (s *Store) DropDefinitionIndexes() error {
+	_, err := s.db.Exec(`
+		DROP INDEX IF EXISTS idx_definitions_module;
+		DROP INDEX IF EXISTS idx_definitions_module_function;
+		DROP INDEX IF EXISTS idx_definitions_file_path;
+	`)
+	return err
+}
+
+func (s *Store) CreateDefinitionIndexes() error {
+	return createDefinitionIndexes(s.db)
 }
 
 // GetIndexVersion returns the index version stored in the database, or 0 if
@@ -130,13 +155,10 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	_, err = tx.Exec("DELETE FROM definitions WHERE file_path = ?", path)
-	if err != nil {
+	if _, err := tx.Exec("DELETE FROM definitions WHERE file_path = ?", path); err != nil {
 		return err
 	}
-
-	_, err = tx.Exec("INSERT OR REPLACE INTO files (path, mtime) VALUES (?, ?)", path, info.ModTime().UnixNano())
-	if err != nil {
+	if _, err := tx.Exec("INSERT OR REPLACE INTO files (path, mtime) VALUES (?, ?)", path, info.ModTime().UnixNano()); err != nil {
 		return err
 	}
 
@@ -147,13 +169,122 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 	defer func() { _ = stmt.Close() }()
 
 	for _, d := range defs {
-		_, err := stmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs)
-		if err != nil {
+		if _, err := stmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs); err != nil {
 			return err
 		}
 	}
 
 	return tx.Commit()
+}
+
+// Batch wraps multiple IndexFile operations in a single SQLite transaction
+// with shared prepared statements.
+type Batch struct {
+	tx         *sql.Tx
+	defStmt    *sql.Stmt
+	fileStmt   *sql.Stmt
+	delStmt    *sql.Stmt // nil in insert-only mode
+	insertOnly bool
+}
+
+func (s *Store) BeginBatch() (*Batch, error) {
+	return s.beginBatch(false)
+}
+
+// BeginBulkInsert starts a batch optimized for inserting into an empty table.
+// It skips DELETE statements before each insert. Callers should drop indexes
+// before calling this and recreate them after Commit.
+func (s *Store) BeginBulkInsert() (*Batch, error) {
+	return s.beginBatch(true)
+}
+
+func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+
+	fileStmt, err := tx.Prepare("INSERT OR REPLACE INTO files (path, mtime) VALUES (?, ?)")
+	if err != nil {
+		_ = defStmt.Close()
+		_ = tx.Rollback()
+		return nil, err
+	}
+
+	b := &Batch{
+		tx:         tx,
+		defStmt:    defStmt,
+		fileStmt:   fileStmt,
+		insertOnly: insertOnly,
+	}
+
+	if !insertOnly {
+		b.delStmt, err = tx.Prepare("DELETE FROM definitions WHERE file_path = ?")
+		if err != nil {
+			_ = defStmt.Close()
+			_ = fileStmt.Close()
+			_ = tx.Rollback()
+			return nil, err
+		}
+	}
+
+	return b, nil
+}
+
+func (b *Batch) IndexFile(path string, defs []parser.Definition) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	return b.indexFile(path, info.ModTime().UnixNano(), defs)
+}
+
+func (b *Batch) IndexFileWithMtime(path string, mtimeNano int64, defs []parser.Definition) error {
+	return b.indexFile(path, mtimeNano, defs)
+}
+
+func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition) error {
+	if !b.insertOnly {
+		if _, err := b.delStmt.Exec(path); err != nil {
+			return err
+		}
+	}
+
+	if _, err := b.fileStmt.Exec(path, mtimeNano); err != nil {
+		return err
+	}
+
+	for _, d := range defs {
+		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (b *Batch) Commit() error {
+	b.closeStmts()
+	return b.tx.Commit()
+}
+
+func (b *Batch) Rollback() error {
+	b.closeStmts()
+	return b.tx.Rollback()
+}
+
+func (b *Batch) closeStmts() {
+	_ = b.defStmt.Close()
+	_ = b.fileStmt.Close()
+	if b.delStmt != nil {
+		_ = b.delStmt.Close()
+	}
 }
 
 func (s *Store) ListFilePaths() ([]string, error) {

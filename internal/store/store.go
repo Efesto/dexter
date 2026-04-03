@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,25 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// SetBulkPragmas configures SQLite for maximum write throughput. Safe only
+// when the database is fresh and throwaway-on-crash (e.g. a forced full
+// rebuild): synchronous=OFF skips all fsyncs, journal_mode=OFF eliminates
+// WAL writes entirely, a large cache keeps pages in RAM during index
+// creation, and temp_store=MEMORY keeps sort temporaries off disk.
+func (s *Store) SetBulkPragmas() error {
+	for _, pragma := range []string{
+		"PRAGMA synchronous = OFF",
+		"PRAGMA journal_mode = MEMORY",
+		"PRAGMA cache_size = -2000000",
+		"PRAGMA temp_store = MEMORY",
+	} {
+		if _, err := s.db.Exec(pragma); err != nil {
+			return fmt.Errorf("%s: %w", pragma, err)
+		}
+	}
+	return nil
+}
+
 func migrate(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS files (
@@ -54,6 +74,15 @@ func migrate(db *sql.DB) error {
 			FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
 		);
 
+		CREATE TABLE IF NOT EXISTS refs (
+			module TEXT NOT NULL,
+			function TEXT NOT NULL DEFAULT '',
+			line INTEGER NOT NULL,
+			file_path TEXT NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'call',
+			FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
+		);
+
 		CREATE TABLE IF NOT EXISTS metadata (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -62,33 +91,39 @@ func migrate(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	return createDefinitionIndexes(db)
+	return createIndexes(db)
 }
 
 type dbExecer interface {
 	Exec(query string, args ...interface{}) (sql.Result, error)
 }
 
-func createDefinitionIndexes(db dbExecer) error {
+func createIndexes(db dbExecer) error {
 	_, err := db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_definitions_module ON definitions(module);
 		CREATE INDEX IF NOT EXISTS idx_definitions_module_function ON definitions(module, function);
 		CREATE INDEX IF NOT EXISTS idx_definitions_file_path ON definitions(file_path);
+		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function);
+		CREATE INDEX IF NOT EXISTS idx_refs_file_path ON refs(file_path);
+		CREATE INDEX IF NOT EXISTS idx_refs_function_kind ON refs(function, kind);
 	`)
 	return err
 }
 
-func (s *Store) DropDefinitionIndexes() error {
+func (s *Store) DropIndexes() error {
 	_, err := s.db.Exec(`
 		DROP INDEX IF EXISTS idx_definitions_module;
 		DROP INDEX IF EXISTS idx_definitions_module_function;
 		DROP INDEX IF EXISTS idx_definitions_file_path;
+		DROP INDEX IF EXISTS idx_refs_module_function;
+		DROP INDEX IF EXISTS idx_refs_file_path;
+		DROP INDEX IF EXISTS idx_refs_function_kind;
 	`)
 	return err
 }
 
-func (s *Store) CreateDefinitionIndexes() error {
-	return createDefinitionIndexes(s.db)
+func (s *Store) CreateIndexes() error {
+	return createIndexes(s.db)
 }
 
 // GetIndexVersion returns the index version stored in the database, or 0 if
@@ -145,6 +180,10 @@ func (s *Store) GetFileMtime(path string) (int64, bool) {
 }
 
 func (s *Store) IndexFile(path string, defs []parser.Definition) error {
+	return s.IndexFileWithRefs(path, defs, nil)
+}
+
+func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []parser.Reference) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -159,19 +198,36 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 	if _, err := tx.Exec("DELETE FROM definitions WHERE file_path = ?", path); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("DELETE FROM refs WHERE file_path = ?", path); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("INSERT OR REPLACE INTO files (path, mtime) VALUES (?, ?)", path, info.ModTime().UnixNano()); err != nil {
 		return err
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
-	defer func() { _ = stmt.Close() }()
+	defer func() { _ = defStmt.Close() }()
 
 	for _, d := range defs {
-		if _, err := stmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs); err != nil {
+		if _, err := defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs); err != nil {
 			return err
+		}
+	}
+
+	if len(refs) > 0 {
+		refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_path, kind) VALUES (?, ?, ?, ?, ?)")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = refStmt.Close() }()
+
+		for _, r := range refs {
+			if _, err := refStmt.Exec(r.Module, r.Function, r.Line, r.FilePath, r.Kind); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -183,8 +239,10 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 type Batch struct {
 	tx         *sql.Tx
 	defStmt    *sql.Stmt
+	refStmt    *sql.Stmt
 	fileStmt   *sql.Stmt
-	delStmt    *sql.Stmt // nil in insert-only mode
+	delDefStmt *sql.Stmt // nil in insert-only mode
+	delRefStmt *sql.Stmt // nil in insert-only mode
 	insertOnly bool
 }
 
@@ -211,9 +269,17 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 		return nil, err
 	}
 
+	refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_path, kind) VALUES (?, ?, ?, ?, ?)")
+	if err != nil {
+		_ = defStmt.Close()
+		_ = tx.Rollback()
+		return nil, err
+	}
+
 	fileStmt, err := tx.Prepare("INSERT OR REPLACE INTO files (path, mtime) VALUES (?, ?)")
 	if err != nil {
 		_ = defStmt.Close()
+		_ = refStmt.Close()
 		_ = tx.Rollback()
 		return nil, err
 	}
@@ -221,15 +287,21 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 	b := &Batch{
 		tx:         tx,
 		defStmt:    defStmt,
+		refStmt:    refStmt,
 		fileStmt:   fileStmt,
 		insertOnly: insertOnly,
 	}
 
 	if !insertOnly {
-		b.delStmt, err = tx.Prepare("DELETE FROM definitions WHERE file_path = ?")
+		b.delDefStmt, err = tx.Prepare("DELETE FROM definitions WHERE file_path = ?")
 		if err != nil {
-			_ = defStmt.Close()
-			_ = fileStmt.Close()
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+		b.delRefStmt, err = tx.Prepare("DELETE FROM refs WHERE file_path = ?")
+		if err != nil {
+			b.closeStmts()
 			_ = tx.Rollback()
 			return nil, err
 		}
@@ -243,16 +315,23 @@ func (b *Batch) IndexFile(path string, defs []parser.Definition) error {
 	if err != nil {
 		return err
 	}
-	return b.indexFile(path, info.ModTime().UnixNano(), defs)
+	return b.indexFile(path, info.ModTime().UnixNano(), defs, nil)
 }
 
 func (b *Batch) IndexFileWithMtime(path string, mtimeNano int64, defs []parser.Definition) error {
-	return b.indexFile(path, mtimeNano, defs)
+	return b.indexFile(path, mtimeNano, defs, nil)
 }
 
-func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition) error {
+func (b *Batch) IndexFileWithMtimeAndRefs(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
+	return b.indexFile(path, mtimeNano, defs, refs)
+}
+
+func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
 	if !b.insertOnly {
-		if _, err := b.delStmt.Exec(path); err != nil {
+		if _, err := b.delDefStmt.Exec(path); err != nil {
+			return err
+		}
+		if _, err := b.delRefStmt.Exec(path); err != nil {
 			return err
 		}
 	}
@@ -263,6 +342,12 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 
 	for _, d := range defs {
 		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs); err != nil {
+			return err
+		}
+	}
+
+	for _, r := range refs {
+		if _, err := b.refStmt.Exec(r.Module, r.Function, r.Line, r.FilePath, r.Kind); err != nil {
 			return err
 		}
 	}
@@ -282,9 +367,13 @@ func (b *Batch) Rollback() error {
 
 func (b *Batch) closeStmts() {
 	_ = b.defStmt.Close()
+	_ = b.refStmt.Close()
 	_ = b.fileStmt.Close()
-	if b.delStmt != nil {
-		_ = b.delStmt.Close()
+	if b.delDefStmt != nil {
+		_ = b.delDefStmt.Close()
+	}
+	if b.delRefStmt != nil {
+		_ = b.delRefStmt.Close()
 	}
 }
 
@@ -457,6 +546,62 @@ func (s *Store) queryLookup(query string, args ...interface{}) ([]LookupResult, 
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+type ReferenceResult struct {
+	FilePath string
+	Line     int
+	Kind     string
+}
+
+func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, error) {
+	query := "SELECT file_path, line, kind FROM refs WHERE module = ?"
+	args := []interface{}{module}
+	if function != "" {
+		query += " AND function = ?"
+		args = append(args, function)
+	}
+	query += " ORDER BY file_path, line"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []ReferenceResult
+	for rows.Next() {
+		var r ReferenceResult
+		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// ListCallerModulesForFunction returns the distinct set of modules that have
+// call-site refs for the given function name. Used to find transitive references
+// through use/import chains.
+func (s *Store) ListCallerModulesForFunction(function string) ([]string, error) {
+	rows, err := s.db.Query(
+		"SELECT DISTINCT module FROM refs WHERE function = ? AND kind = 'call'",
+		function,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var modules []string
+	for rows.Next() {
+		var mod string
+		if err := rows.Scan(&mod); err != nil {
+			return nil, err
+		}
+		modules = append(modules, mod)
+	}
+	return modules, rows.Err()
 }
 
 func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {

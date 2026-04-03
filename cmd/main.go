@@ -81,6 +81,25 @@ func main() {
 	lookupCmd.Flags().BoolVar(&strict, "strict", false, "Exit 1 if exact match not found (no fallback)")
 	lookupCmd.Flags().BoolVar(&noFollowDelegates, "no-follow-delegates", false, "Don't follow defdelegate to the target module")
 
+	referencesCmd := &cobra.Command{
+		Use:   "references <module> [func]",
+		Short: "Find references to a module/function",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			module := args[0]
+			function := ""
+			if len(args) == 2 {
+				function = args[1]
+			}
+			projectRoot, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			cmdReferences(projectRoot, module, function)
+			return nil
+		},
+	}
+
 	lspCmd := &cobra.Command{
 		Use:   "lsp [path]",
 		Short: "Start the LSP server (stdio)",
@@ -103,7 +122,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, lspCmd, versionCmd)
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, lspCmd, versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -167,6 +186,10 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 		}
 	}()
 
+	if err := s.SetBulkPragmas(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: bulk pragma setup: %v\n", err)
+	}
+
 	prof := &profiler{enabled: profile}
 	start := time.Now()
 
@@ -197,13 +220,14 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 			return nil
 		})
 	}
-	prof.log("  walk: %s (%d files)\n", prof.since(start).Round(time.Millisecond), len(files))
+	prof.log("  walk: %s (%s files)\n", prof.since(start).Round(time.Millisecond), formatInt(len(files)))
 
 	// Phase 2: parse in parallel
 	type parseResult struct {
 		path      string
 		mtimeNano int64
 		defs      []parser.Definition
+		refs      []parser.Reference
 	}
 
 	workers := runtime.NumCPU()
@@ -218,13 +242,13 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 			defer wg.Done()
 			for f := range fileCh {
 				t0 := prof.now()
-				defs, err := parser.ParseFile(f.path)
-				parseNanos.Add(int64(prof.since(t0)))
+				defs, refs, err := parser.ParseFile(f.path)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", f.path, err)
 					continue
 				}
-				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs}
+				parseNanos.Add(int64(prof.since(t0)))
+				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs, refs: refs}
 			}
 		}()
 	}
@@ -240,7 +264,7 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 
 	// Phase 3: bulk insert to SQLite (single writer, single transaction, no indexes)
 	pipelineStart := prof.now()
-	if err := s.DropDefinitionIndexes(); err != nil {
+	if err := s.DropIndexes(); err != nil {
 		fatal(err)
 	}
 	batch, err := s.BeginBulkInsert()
@@ -249,16 +273,18 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 	}
 	count := 0
 	defCount := 0
+	refCount := 0
 	var writeNanos int64
 	for res := range resultCh {
 		t0 := prof.now()
-		if err := batch.IndexFileWithMtime(res.path, res.mtimeNano, res.defs); err != nil {
+		if err := batch.IndexFileWithMtimeAndRefs(res.path, res.mtimeNano, res.defs, res.refs); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", res.path, err)
 			continue
 		}
 		writeNanos += int64(prof.since(t0))
 		count++
 		defCount += len(res.defs)
+		refCount += len(res.refs)
 	}
 	prof.log("  parse+write: %s (parse: %s across %d workers, write: %s)\n",
 		prof.since(pipelineStart).Round(time.Millisecond),
@@ -273,16 +299,16 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 	prof.log("  commit: %s\n", prof.since(commitStart).Round(time.Millisecond))
 
 	indexStart := prof.now()
-	if err := s.CreateDefinitionIndexes(); err != nil {
+	if err := s.CreateIndexes(); err != nil {
 		fatal(err)
 	}
-	prof.log("  create indexes: %s\n", prof.since(indexStart).Round(time.Millisecond))
+	prof.log("  create indices: %s\n", prof.since(indexStart).Round(time.Millisecond))
 
 	if err := s.SetIndexVersion(version.IndexVersion); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to store index version: %v\n", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Indexed %d files (%d definitions) in %s\n", count, defCount, time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "Indexed %s files (%s definitions, %s references) in %s\n", formatInt(count), formatInt(defCount), formatInt(refCount), time.Since(start).Round(time.Millisecond))
 }
 
 func cmdReindex(target string) {
@@ -352,12 +378,12 @@ func cmdReindex(target string) {
 }
 
 func reindexFile(s *store.Store, path string) {
-	defs, err := parser.ParseFile(path)
+	defs, refs, err := parser.ParseFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", path, err)
 		return
 	}
-	if err := s.IndexFile(path, defs); err != nil {
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", path, err)
 	}
 }
@@ -408,12 +434,54 @@ func cmdLookup(projectRoot string, module string, function string, strict bool, 
 	}
 }
 
-func cmdLSP(projectRoot string) {
+func cmdReferences(projectRoot string, module string, function string) {
 	projectRoot = findProjectRoot(projectRoot)
-
 	s, err := store.Open(projectRoot)
 	if err != nil {
 		fatal(err)
+	}
+	defer func() {
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
+		}
+	}()
+
+	results, err := s.LookupReferences(module, function)
+	if err != nil {
+		fatal(err)
+	}
+	if len(results) == 0 {
+		fmt.Fprintf(os.Stderr, "No references found for %s", module)
+		if function != "" {
+			fmt.Fprintf(os.Stderr, ".%s", function)
+		}
+		fmt.Fprintln(os.Stderr)
+		os.Exit(1)
+	}
+	for _, r := range results {
+		fmt.Printf("%s:%d\n", r.FilePath, r.Line)
+	}
+}
+
+func cmdLSP(projectRoot string) {
+	projectRoot = findProjectRoot(projectRoot)
+
+	const maxOpenAttempts = 3
+	var s *store.Store
+	for attempt := 1; ; attempt++ {
+		var err error
+		s, err = store.Open(projectRoot)
+		if err == nil {
+			break
+		}
+		if attempt >= maxOpenAttempts {
+			fatal(fmt.Errorf("failed to open index after %d attempts: %w. Try `dexter init --force` in your project root and then restart your editor/the LSP", maxOpenAttempts, err))
+		}
+		// DB may be corrupted (e.g. ctrl-c, process killed, power loss during a previous init).
+		// cmdInit with force=true deletes and rebuilds from scratch.
+		log.SetOutput(os.Stderr)
+		log.Printf("Failed to open index (attempt %d/%d: %v), rebuilding from scratch...", attempt, maxOpenAttempts, err)
+		cmdInit(projectRoot, true, false)
 	}
 
 	if stored := s.GetIndexVersion(); stored != version.IndexVersion {
@@ -423,9 +491,10 @@ func cmdLSP(projectRoot string) {
 			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
 		}
 		cmdInit(projectRoot, true, false)
-		s, err = store.Open(projectRoot)
-		if err != nil {
-			fatal(err)
+		var openErr error
+		s, openErr = store.Open(projectRoot)
+		if openErr != nil {
+			fatal(openErr)
 		}
 	}
 	defer func() {
@@ -440,6 +509,21 @@ func cmdLSP(projectRoot string) {
 	if err := dexter_lsp.Serve(os.Stdin, os.Stdout, s, projectRoot); err != nil {
 		fatal(err)
 	}
+}
+
+func formatInt(n int) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var result []byte
+	for i, ch := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, byte(ch))
+	}
+	return string(result)
 }
 
 func fatal(err error) {

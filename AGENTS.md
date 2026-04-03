@@ -25,16 +25,16 @@ Tests include unit tests for the parser, store, and LSP elixir analysis function
 
 ## Linting
 
-Run `golangci-lint` after completing a set of changes and before marking work as done:
+Run `make lint` after completing a set of changes and before marking work as done:
 
 ```sh
-golangci-lint run ./...
+make lint
 ```
 
-Install via Go modules if you don't yet have it:
+Install `golangci-lint` via Go modules if you don't yet have it:
 
 ```sh
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.9.0
 ```
 
 ## Key design decisions
@@ -46,6 +46,16 @@ go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 - **Git HEAD polling** — the LSP server watches `.git/HEAD` mtime every 2 seconds to detect branch switches and trigger reindex.
 - **Full document sync** — the LSP uses `TextDocumentSyncKindFull` since Elixir files are small.
 - **Index versioning** — `internal/version/version.go` has an `IndexVersion` integer alongside `Version`. When the LSP server or `reindex` command starts, it checks the version stored in the `metadata` table against `IndexVersion`. A mismatch triggers an automatic forced rebuild. Bump `IndexVersion` (alongside `Version`) whenever a parser change or schema change would make existing indexes produce wrong results.
+
+## Performance
+
+Any changes that touch the parser or indexing pipeline should be profiled against a real Elixir codebase to verify they don't increase cold indexing time. Use the built-in profiling flag:
+
+```sh
+dexter init --force --profile /path/to/elixir/project
+```
+
+`--force` ensures a full cold index (no mtime cache hits). `--profile` prints a timing breakdown for each indexing phase to stdout. Compare results before and after your change on the same codebase. A large Elixir project (e.g. several thousand files) gives the most signal.
 
 ## Conventions
 

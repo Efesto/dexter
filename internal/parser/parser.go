@@ -23,6 +23,23 @@ var (
 	newStatementRe = regexp.MustCompile(`^\s*(defdelegate|defp?|defmacrop?|defguardp?|alias|import|@|end)\b`)
 )
 
+// elixirKeyword is the set of Elixir language constructs that take do blocks
+// but are NOT user-defined macros — excluded from bare macro call tracking.
+var elixirKeyword = map[string]bool{
+	// Control flow
+	"if": true, "unless": true, "cond": true, "case": true,
+	"try": true, "receive": true, "for": true, "with": true,
+	"fn": true, "do": true, "end": true, "else": true,
+	"after": true, "catch": true, "rescue": true,
+	"quote": true, "unquote": true, "when": true,
+	"and": true, "or": true, "not": true, "in": true,
+	// Definition keywords — def lines end with " do" but are definitions, not calls
+	"def": true, "defp": true, "defmacro": true, "defmacrop": true,
+	"defguard": true, "defguardp": true, "defdelegate": true,
+	"defmodule": true, "defprotocol": true, "defimpl": true,
+	"defstruct": true, "defexception": true,
+}
+
 type Definition struct {
 	Module     string
 	Function   string
@@ -34,10 +51,18 @@ type Definition struct {
 	DelegateAs string // for defdelegate with as: — the function name in the target module
 }
 
-func ParseFile(path string) ([]Definition, error) {
+type Reference struct {
+	Module   string // fully-resolved module name
+	Function string // function name (empty for module-only refs like alias/import/use)
+	Line     int
+	FilePath string
+	Kind     string // "call", "alias", "import", "use"
+}
+
+func ParseFile(path string) ([]Definition, []Reference, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	type moduleFrame struct {
@@ -47,8 +72,10 @@ func ParseFile(path string) ([]Definition, error) {
 
 	lines := strings.Split(string(data), "\n")
 	var defs []Definition
+	var refs []Reference
 	var moduleStack []moduleFrame
 	aliases := map[string]string{} // short name -> full module
+	injectors := map[string]bool{} // modules from use/import that inject bare functions
 	inHeredoc := false
 
 	for lineIdx, line := range lines {
@@ -71,7 +98,6 @@ func ParseFile(path string) ([]Definition, error) {
 		}
 
 		// Find first non-whitespace character for fast pre-filtering.
-		// All patterns we match start with a keyword: def*, alias, @type, or end.
 		trimStart := 0
 		for trimStart < len(line) && (line[trimStart] == ' ' || line[trimStart] == '\t') {
 			trimStart++
@@ -82,19 +108,15 @@ func ParseFile(path string) ([]Definition, error) {
 		first := line[trimStart]
 		rest := line[trimStart:] // line content from first non-whitespace char
 
-		// 'e' — check for "end" to pop module stack
+		// 'e' — check for "end" to pop module stack; otherwise fall through
 		if first == 'e' {
 			if len(moduleStack) > 0 && strings.TrimRight(rest, " \t\r") == "end" {
 				if moduleStack[len(moduleStack)-1].indent == trimStart {
 					moduleStack = moduleStack[:len(moduleStack)-1]
 				}
+				continue
 			}
-			continue
-		}
-
-		// Skip lines that can't match any pattern we care about
-		if first != 'a' && first != 'd' && first != '@' {
-			continue
+			// Not "end" — may be a bare macro call like "embedded_schema do"
 		}
 
 		currentModule := ""
@@ -102,160 +124,280 @@ func ParseFile(path string) ([]Definition, error) {
 			currentModule = moduleStack[len(moduleStack)-1].name
 		}
 
-		// 'a' — alias tracking
+		// 'a' — alias tracking (+ emit alias ref)
 		if first == 'a' {
-			if !strings.HasPrefix(rest, "alias") || (len(rest) > 5 && rest[5] != ' ' && rest[5] != '\t') {
-				continue
-			}
-			resolveModule := func(s string) string {
-				if currentModule != "" {
-					return strings.ReplaceAll(s, "__MODULE__", currentModule)
-				}
-				return s
-			}
-			afterAlias := strings.TrimLeft(rest[5:], " \t")
-			moduleName := scanModuleName(afterAlias)
-			if moduleName == "" {
-				continue
-			}
-			// Check for ", as:" pattern
-			remaining := afterAlias[len(moduleName):]
-			remaining = strings.TrimLeft(remaining, " \t")
-			if strings.HasPrefix(remaining, ", as:") || strings.HasPrefix(remaining, ",as:") {
-				asStr := remaining[strings.Index(remaining, "as:")+3:]
-				asStr = strings.TrimLeft(asStr, " \t")
-				asName := scanIdentifier(asStr)
-				if asName != "" {
-					resolved := resolveModule(moduleName)
-					if !strings.Contains(resolved, "__MODULE__") {
-						aliases[asName] = resolved
+			if strings.HasPrefix(rest, "alias") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
+				afterAlias := strings.TrimLeft(rest[5:], " \t")
+				moduleName := scanModuleName(afterAlias)
+				if moduleName != "" {
+					remaining := afterAlias[len(moduleName):]
+					remaining = strings.TrimLeft(remaining, " \t")
+					if strings.HasPrefix(remaining, ", as:") {
+						asStr := strings.TrimLeft(remaining[5:], " \t") // skip ", as:"
+						asName := scanIdentifier(asStr)
+						if asName != "" {
+							resolved := resolveModule(moduleName, currentModule)
+							if !strings.Contains(resolved, "__MODULE__") {
+								aliases[asName] = resolved
+								refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "alias"})
+							}
+						}
+					} else if strings.HasPrefix(remaining, ",as:") {
+						asStr := strings.TrimLeft(remaining[4:], " \t") // skip ",as:"
+						asName := scanIdentifier(asStr)
+						if asName != "" {
+							resolved := resolveModule(moduleName, currentModule)
+							if !strings.Contains(resolved, "__MODULE__") {
+								aliases[asName] = resolved
+								refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "alias"})
+							}
+						}
+					} else {
+						resolved := resolveModule(moduleName, currentModule)
+						dot := strings.LastIndexByte(resolved, '.')
+						var shortName string
+						if dot >= 0 {
+							shortName = resolved[dot+1:]
+						} else {
+							shortName = resolved
+						}
+						aliases[shortName] = resolved
+						if !strings.Contains(resolved, "__MODULE__") {
+							refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "alias"})
+						}
 					}
+					continue
 				}
-			} else {
-				resolved := resolveModule(moduleName)
-				parts := strings.Split(resolved, ".")
-				shortName := parts[len(parts)-1]
-				aliases[shortName] = resolved
 			}
-			continue
+			// Not an alias — fall through to ref extraction
+			goto extractCallRefs
+		}
+
+		// 'i' — import (refs only)
+		if first == 'i' {
+			if strings.HasPrefix(rest, "import") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
+				afterImport := strings.TrimLeft(rest[6:], " \t")
+				moduleName := scanModuleName(afterImport)
+				if moduleName != "" {
+					resolved := resolveModule(moduleName, currentModule)
+					if !strings.Contains(resolved, "__MODULE__") {
+						refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "import"})
+						injectors[resolved] = true
+					}
+					continue
+				}
+			}
+			goto extractCallRefs
+		}
+
+		// 'u' — use (refs only)
+		if first == 'u' {
+			if strings.HasPrefix(rest, "use") && len(rest) > 3 && (rest[3] == ' ' || rest[3] == '\t') {
+				afterUse := strings.TrimLeft(rest[3:], " \t")
+				moduleName := scanModuleName(afterUse)
+				if moduleName != "" {
+					resolved := resolveModule(moduleName, currentModule)
+					if !strings.Contains(resolved, "__MODULE__") {
+						refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "use"})
+						injectors[resolved] = true
+					}
+					continue
+				}
+			}
+			goto extractCallRefs
 		}
 
 		// '@' — type definitions (@type, @typep, @opaque)
 		if first == '@' {
-			if currentModule == "" {
-				continue
-			}
-			var kind string
-			var afterKw string
-			if strings.HasPrefix(rest, "@typep") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
-				kind = "typep"
-				afterKw = strings.TrimLeft(rest[6:], " \t")
-			} else if strings.HasPrefix(rest, "@type") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
-				kind = "type"
-				afterKw = strings.TrimLeft(rest[5:], " \t")
-			} else if strings.HasPrefix(rest, "@opaque") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t') {
-				kind = "opaque"
-				afterKw = strings.TrimLeft(rest[7:], " \t")
-			} else {
-				continue
-			}
-			name := scanFuncName(afterKw)
-			if name != "" {
-				defs = append(defs, Definition{
-					Module:   currentModule,
-					Function: name,
-					Arity:    ExtractArity(line, name),
-					Line:     lineNum,
-					FilePath: path,
-					Kind:     kind,
-				})
+			if currentModule != "" {
+				var kind string
+				var afterKw string
+				if strings.HasPrefix(rest, "@typep") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
+					kind = "typep"
+					afterKw = strings.TrimLeft(rest[6:], " \t")
+				} else if strings.HasPrefix(rest, "@type") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
+					kind = "type"
+					afterKw = strings.TrimLeft(rest[5:], " \t")
+				} else if strings.HasPrefix(rest, "@opaque") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t') {
+					kind = "opaque"
+					afterKw = strings.TrimLeft(rest[7:], " \t")
+				}
+				if kind != "" {
+					name := scanFuncName(afterKw)
+					if name != "" {
+						defs = append(defs, Definition{
+							Module:   currentModule,
+							Function: name,
+							Arity:    ExtractArity(line, name),
+							Line:     lineNum,
+							FilePath: path,
+							Kind:     kind,
+						})
+					}
+				}
 			}
 			continue
 		}
 
 		// 'd' — defmodule, defprotocol, defimpl, def*, defstruct, defexception
-		if !strings.HasPrefix(rest, "def") {
-			continue
-		}
-
-		if name, ok := scanDefKeyword(rest, "defmodule"); ok {
-			if !strings.Contains(name, ".") && currentModule != "" {
-				name = currentModule + "." + name
-			}
-			currentModule = name
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
-			defs = append(defs, Definition{
-				Module:   currentModule,
-				Line:     lineNum,
-				FilePath: path,
-				Kind:     "module",
-			})
-			continue
-		}
-
-		if name, ok := scanDefKeyword(rest, "defprotocol"); ok {
-			currentModule = name
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
-			defs = append(defs, Definition{
-				Module:   currentModule,
-				Line:     lineNum,
-				FilePath: path,
-				Kind:     "defprotocol",
-			})
-			continue
-		}
-
-		if name, ok := scanDefKeyword(rest, "defimpl"); ok {
-			currentModule = name
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
-			defs = append(defs, Definition{
-				Module:   currentModule,
-				Line:     lineNum,
-				FilePath: path,
-				Kind:     "defimpl",
-			})
-			continue
-		}
-
-		if currentModule != "" {
-			if kind, funcName, ok := scanFuncDef(rest); ok {
-				def := Definition{
+		if first == 'd' && strings.HasPrefix(rest, "def") {
+			if name, ok := scanDefKeyword(rest, "defmodule"); ok {
+				if !strings.Contains(name, ".") && currentModule != "" {
+					name = currentModule + "." + name
+				}
+				currentModule = name
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
+				defs = append(defs, Definition{
 					Module:   currentModule,
-					Function: funcName,
-					Arity:    ExtractArity(line, funcName),
 					Line:     lineNum,
 					FilePath: path,
-					Kind:     kind,
-				}
-				if kind == "defdelegate" {
-					def.DelegateTo, def.DelegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
-				}
-				defs = append(defs, def)
+					Kind:     "module",
+				})
 				continue
 			}
 
-			if strings.HasPrefix(rest, "defstruct ") || strings.HasPrefix(rest, "defstruct\t") {
+			if name, ok := scanDefKeyword(rest, "defprotocol"); ok {
+				currentModule = name
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
 				defs = append(defs, Definition{
 					Module:   currentModule,
-					Function: "__struct__",
 					Line:     lineNum,
 					FilePath: path,
-					Kind:     "defstruct",
+					Kind:     "defprotocol",
 				})
+				continue
 			}
-			if strings.HasPrefix(rest, "defexception ") || strings.HasPrefix(rest, "defexception\t") {
+
+			if name, ok := scanDefKeyword(rest, "defimpl"); ok {
+				currentModule = name
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
 				defs = append(defs, Definition{
 					Module:   currentModule,
-					Function: "__exception__",
 					Line:     lineNum,
 					FilePath: path,
-					Kind:     "defexception",
+					Kind:     "defimpl",
+				})
+				continue
+			}
+
+			if currentModule != "" {
+				if kind, funcName, ok := scanFuncDef(rest); ok {
+					def := Definition{
+						Module:   currentModule,
+						Function: funcName,
+						Arity:    ExtractArity(line, funcName),
+						Line:     lineNum,
+						FilePath: path,
+						Kind:     kind,
+					}
+					if kind == "defdelegate" {
+						def.DelegateTo, def.DelegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
+					}
+					defs = append(defs, def)
+					// Don't continue — line may contain refs like: def foo, do: Repo.all()
+					goto extractCallRefs
+				}
+
+				if strings.HasPrefix(rest, "defstruct ") || strings.HasPrefix(rest, "defstruct\t") {
+					defs = append(defs, Definition{
+						Module:   currentModule,
+						Function: "__struct__",
+						Line:     lineNum,
+						FilePath: path,
+						Kind:     "defstruct",
+					})
+				}
+				if strings.HasPrefix(rest, "defexception ") || strings.HasPrefix(rest, "defexception\t") {
+					defs = append(defs, Definition{
+						Module:   currentModule,
+						Function: "__exception__",
+						Line:     lineNum,
+						FilePath: path,
+						Kind:     "defexception",
+					})
+				}
+			}
+			// Fall through to ref extraction for lines like: def foo, do: Mod.func()
+		}
+
+	extractCallRefs:
+		// Detect bare calls to functions/macros from use'd/import'd modules.
+		// Detect bare calls to functions/macros from use'd/import'd modules.
+		if currentModule != "" && len(injectors) > 0 {
+			trimmedRest := strings.TrimRight(rest, " \t\r")
+			if strings.HasSuffix(trimmedRest, " do") || strings.HasSuffix(trimmedRest, "\tdo") {
+				// Macro call with do block: embedded_schema do, schema "t" do, test "x" do
+				name := scanFuncName(rest)
+				if name != "" && !elixirKeyword[name] {
+					for mod := range injectors {
+						refs = append(refs, Reference{Module: mod, Function: name, Line: lineNum, FilePath: path, Kind: "call"})
+					}
+				}
+			} else {
+				// DSL call at line start: field :name, :string  or  cast(struct, params)
+				name := scanFuncName(rest)
+				if name != "" && !elixirKeyword[name] {
+					after := rest[len(name):]
+					if len(after) > 0 && (after[0] == '(' || (after[0] == ' ' && len(after) > 1 && after[1] == ':')) {
+						for mod := range injectors {
+							refs = append(refs, Reference{Module: mod, Function: name, Line: lineNum, FilePath: path, Kind: "call"})
+						}
+					}
+				}
+				// Pipe call: |> cast_embed(:jobs), |> validate_required(...)
+				if idx := strings.Index(rest, "|>"); idx >= 0 {
+					afterPipe := strings.TrimLeft(rest[idx+2:], " \t")
+					name := scanFuncName(afterPipe)
+					if name != "" && !elixirKeyword[name] {
+						for mod := range injectors {
+							refs = append(refs, Reference{Module: mod, Function: name, Line: lineNum, FilePath: path, Kind: "call"})
+						}
+					}
+				}
+			}
+		}
+
+		// Extract Module.function call references from any line.
+		// Quick check: moduleCallRe requires an uppercase letter, so skip lines without one.
+		if !hasUppercase(line) {
+			continue
+		}
+		{
+			codeLine := stripCommentsAndStrings(line)
+			for _, match := range moduleCallRe.FindAllStringSubmatch(codeLine, -1) {
+				modRef := match[1]
+				funcName := match[2]
+
+				if elixirKeyword[funcName] {
+					continue
+				}
+
+				resolved := modRef
+				if full, ok := aliases[modRef]; ok {
+					resolved = full
+				} else if parts := strings.SplitN(modRef, ".", 2); len(parts) == 2 {
+					if full, ok := aliases[parts[0]]; ok {
+						resolved = full + "." + parts[1]
+					}
+				}
+				resolved = resolveModule(resolved, currentModule)
+
+				if strings.Contains(resolved, "__MODULE__") {
+					continue
+				}
+
+				refs = append(refs, Reference{
+					Module:   resolved,
+					Function: funcName,
+					Line:     lineNum,
+					FilePath: path,
+					Kind:     "call",
 				})
 			}
 		}
 	}
 
-	return defs, nil
+	return defs, refs, nil
 }
 
 // scanModuleName reads a module name ([A-Za-z0-9_.]+) from the start of s.
@@ -465,6 +607,103 @@ func ExtractArity(line string, funcName string) int {
 		return commas + 1
 	}
 	return 0
+}
+
+func resolveModule(s, currentModule string) string {
+	if currentModule != "" {
+		return strings.ReplaceAll(s, "__MODULE__", currentModule)
+	}
+	return s
+}
+
+// moduleCallRe matches Module.function calls — an uppercase module segment
+// followed by a dot and a lowercase function name.
+var moduleCallRe = regexp.MustCompile(`([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\.([a-z_][a-z0-9_?!]*)`)
+
+func hasUppercase(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// stripCommentsAndStrings removes inline comments and replaces the content
+// of string literals with spaces so that regex-based extraction doesn't
+// produce false-positive references from comments or string values.
+func stripCommentsAndStrings(line string) string {
+	buf := []byte(line)
+	i := 0
+	for i < len(buf) {
+		ch := buf[i]
+		// Skip escaped characters
+		if ch == '\\' && i+1 < len(buf) {
+			i += 2
+			continue
+		}
+		// String literal (double-quoted)
+		if ch == '"' {
+			j := i + 1
+			for j < len(buf) {
+				if buf[j] == '\\' && j+1 < len(buf) {
+					j += 2
+					continue
+				}
+				if buf[j] == '"' {
+					// Blank out string contents (keep quotes for structure)
+					for k := i + 1; k < j; k++ {
+						buf[k] = ' '
+					}
+					i = j + 1
+					break
+				}
+				j++
+			}
+			if j >= len(buf) {
+				// Unterminated string — blank to end
+				for k := i + 1; k < len(buf); k++ {
+					buf[k] = ' '
+				}
+				break
+			}
+			continue
+		}
+		// Single-quoted charlist
+		if ch == '\'' {
+			j := i + 1
+			for j < len(buf) {
+				if buf[j] == '\\' && j+1 < len(buf) {
+					j += 2
+					continue
+				}
+				if buf[j] == '\'' {
+					for k := i + 1; k < j; k++ {
+						buf[k] = ' '
+					}
+					i = j + 1
+					break
+				}
+				j++
+			}
+			if j >= len(buf) {
+				for k := i + 1; k < len(buf); k++ {
+					buf[k] = ' '
+				}
+				break
+			}
+			continue
+		}
+		// Comment — blank everything from here to end of line
+		if ch == '#' {
+			for k := i; k < len(buf); k++ {
+				buf[k] = ' '
+			}
+			break
+		}
+		i++
+	}
+	return string(buf)
 }
 
 func IsElixirFile(path string) bool {

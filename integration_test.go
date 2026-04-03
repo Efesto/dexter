@@ -494,3 +494,31 @@ func TestIntegration_InitForce(t *testing.T) {
 		t.Errorf("expected repo lookup to work after force reinit, got: %s", out3)
 	}
 }
+
+// TestIntegration_CorruptDBRecovery simulates the LSP startup recovery path:
+// a corrupted DB is detected, deleted, and rebuilt so that lookups still work.
+// This mirrors the open-with-retry loop in cmdLSP.
+func TestIntegration_CorruptDBRecovery(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+
+	runDexter(t, binary, root, "init", root)
+
+	// Corrupt the DB with garbage bytes
+	dbPath := filepath.Join(root, ".dexter.db")
+	if err := os.WriteFile(dbPath, []byte("not a sqlite database"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// init --force should detect the garbage file, delete it, and rebuild cleanly
+	out := runDexter(t, binary, root, "init", "--force", root)
+	if !strings.Contains(out, "Indexed") {
+		t.Fatalf("expected successful rebuild after corruption, got: %s", out)
+	}
+
+	// Lookups must work after recovery
+	out2 := runDexter(t, binary, root, "lookup", "MyApp.Repo", "get")
+	if !strings.Contains(out2, "repo.ex:2") {
+		t.Errorf("expected lookup to work after corrupt DB recovery, got: %s", out2)
+	}
+}

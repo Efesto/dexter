@@ -28,7 +28,7 @@ func TestParseFile_SingleModule(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestParseFile_MultipleFunctionHeads(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestParseFile_NestedModules(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestParseFile_Macros(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestParseFile_FunctionWithQuestionMark(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestParseFile_HeredocDefmoduleIgnored(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestParseFile_SigillHeredocIgnored(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestParseFile_ModuleNestingRestoresAfterEnd(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestParseFile_SingleLineDefWithDefaultArg(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func TestParseFile_InlineModuledoc(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestParseFile_Defdelegate(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestParseFile_DefdelegateTo(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func TestParseFile_DefdelegateMultiLine(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +484,7 @@ func TestParseFile_DefdelegateAliasAsResolution(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestParseFile_DefdelegateModuleAlias(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +532,7 @@ func TestParseFile_DefdelegateTo__MODULE__Directly(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +559,7 @@ func TestParseFile_AliasModuleAs(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +599,7 @@ func TestParseFile_FunctionsAfterNestedModules(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -654,7 +654,7 @@ func TestParseFile_MacroAfterManyFunctions(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +688,7 @@ func TestParseFile_RelativeNestedModule(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +725,7 @@ func TestParseFile_Defguard(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,7 +752,7 @@ func TestParseFile_Defprotocol(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -784,7 +784,7 @@ func TestParseFile_Defimpl(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,7 +818,7 @@ func TestParseFile_Defstruct(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -841,7 +841,7 @@ func TestParseFile_Defexception(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,7 +870,7 @@ func TestParseFile_WhenGuards(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,7 +910,7 @@ defmodule Enum do
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1101,7 +1101,7 @@ func TestParseFile_StdlibStyleWithManyDocBlocks(t *testing.T) {
 		"end\n"
 	path := writeTempFile(t, content)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1144,7 +1144,7 @@ func TestParseFile_InlineDoSyntax(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1200,7 +1200,7 @@ func TestParseFile_FnEndBlockDoesNotPopModule(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1233,7 +1233,7 @@ func TestParseFile_FnEndWithTrailingParen(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1307,7 +1307,7 @@ func TestParseFile_Arity(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1349,7 +1349,7 @@ func TestParseFile_TypeDefinitions(t *testing.T) {
 end
 `)
 
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1403,7 +1403,7 @@ func TestParseFile_TrailingWhitespaceOnEnd(t *testing.T) {
 	// "end" with trailing whitespace must still pop the module stack,
 	// otherwise the next module's definitions get lost.
 	path := writeTempFile(t, "defmodule MyApp.Foxtrot do\n  def alpha do\n    :ok\n  end\nend   \n\ndefmodule MyApp.Sierra do\n  def beta do\n    :ok\n  end\nend\n")
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1431,7 +1431,7 @@ func TestParseFile_TrailingWhitespaceOnEnd(t *testing.T) {
 
 func TestParseFile_ExtraWhitespaceBeforeDo(t *testing.T) {
 	path := writeTempFile(t, "defmodule  MyApp.Echo  do\n  def run do\n    :ok\n  end\nend\n")
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1445,7 +1445,7 @@ func TestParseFile_ExtraWhitespaceBeforeDo(t *testing.T) {
 
 func TestParseFile_TabSeparatedKeywords(t *testing.T) {
 	path := writeTempFile(t, "defmodule\tMyApp.Tango\tdo\n\tdef\tmeow(arg) do\n\t\t:ok\n\tend\n\t@type\tname :: String.t()\nend\n")
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1476,7 +1476,7 @@ func TestParseFile_TypesNotIndexedOutsideModule(t *testing.T) {
 	// @type at the top level (outside a defmodule) should not be indexed.
 	path := writeTempFile(t, `@type orphan :: integer()
 `)
-	defs, err := ParseFile(path)
+	defs, _, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1485,4 +1485,247 @@ func TestParseFile_TypesNotIndexedOutsideModule(t *testing.T) {
 			t.Error("should not index @type outside of a defmodule")
 		}
 	}
+}
+
+func TestParseFileReferences_ModuleFunctionCalls(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Accounts do
+  alias MyApp.Repo
+  import Ecto.Query
+
+  def list do
+    Repo.all(MyApp.User)
+  end
+
+  def get(id) do
+    Repo.get(MyApp.User, id)
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect: alias MyApp.Repo, import Ecto.Query, Repo.all, MyApp.User (x2), Repo.get
+	callRefs := filterRefs(refs, "call")
+	aliasRefs := filterRefs(refs, "alias")
+	importRefs := filterRefs(refs, "import")
+
+	if len(aliasRefs) != 1 {
+		t.Errorf("expected 1 alias ref, got %d", len(aliasRefs))
+	}
+	if len(importRefs) != 1 {
+		t.Errorf("expected 1 import ref, got %d", len(importRefs))
+	}
+
+	// Repo.all and Repo.get should resolve via alias to MyApp.Repo
+	var repoCallCount int
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Repo" {
+			repoCallCount++
+		}
+	}
+	if repoCallCount != 2 {
+		t.Errorf("expected 2 MyApp.Repo calls (via alias), got %d", repoCallCount)
+	}
+}
+
+func TestParseFileReferences_AliasResolution(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Controller do
+  alias MyApp.Accounts, as: Acc
+
+  def index do
+    Acc.list_users()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	found := false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Accounts" && r.Function == "list_users" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Acc.list_users to resolve to MyApp.Accounts.list_users; refs: %+v", callRefs)
+	}
+}
+
+func TestParseFileReferences_SkipsHeredocs(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  @doc """
+  Calls Other.Module.thing() in documentation
+  """
+  def bar do
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	for _, r := range callRefs {
+		if r.Module == "Other.Module" {
+			t.Error("should not extract references from inside heredocs")
+		}
+	}
+
+	found := false
+	for _, r := range callRefs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call reference")
+	}
+}
+
+func TestParseFileReferences_SkipsCommentsAndStrings(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  def bar do
+    # This is a comment: Fake.Module.call()
+    x = "a string with Fake.Module.call() inside"
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	for _, r := range callRefs {
+		if r.Module == "Fake.Module" {
+			t.Errorf("should not extract references from comments or strings, got %+v", r)
+		}
+	}
+
+	found := false
+	for _, r := range callRefs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call reference")
+	}
+}
+
+func TestParseFileReferences_UseDeclaration(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Worker do
+  use Oban.Worker
+
+  def perform(job) do
+    :ok
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	useRefs := filterRefs(refs, "use")
+	if len(useRefs) != 1 {
+		t.Fatalf("expected 1 use ref, got %d", len(useRefs))
+	}
+	if useRefs[0].Module != "Oban.Worker" {
+		t.Errorf("expected Oban.Worker, got %q", useRefs[0].Module)
+	}
+}
+
+func TestParseFileReferences_BareMacroCalls(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Schema do
+  use MyApp.EctoSchema
+
+  embedded_schema do
+    field :name, :string
+  end
+end
+
+defmodule MyApp.OtherSchema do
+  use MyApp.EctoSchema
+
+  schema "other_things" do
+    field :value, :integer
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// embedded_schema and schema should be attributed to MyApp.EctoSchema (the use'd module)
+	var foundEmbedded, foundSchema bool
+	for _, r := range refs {
+		if r.Kind == "call" && r.Module == "MyApp.EctoSchema" {
+			if r.Function == "embedded_schema" {
+				foundEmbedded = true
+			}
+			if r.Function == "schema" {
+				foundSchema = true
+			}
+		}
+	}
+	if !foundEmbedded {
+		t.Error("expected embedded_schema attributed to MyApp.EctoSchema")
+	}
+	if !foundSchema {
+		t.Error("expected schema attributed to MyApp.EctoSchema")
+	}
+
+	// Elixir keywords must not be captured as bare macro calls
+	for _, r := range refs {
+		if r.Kind == "call" && r.Module != "" && elixirKeyword[r.Function] {
+			t.Errorf("should not capture Elixir keyword %q as bare macro call", r.Function)
+		}
+	}
+}
+
+func TestParseFileReferences_BareMacroNotWithoutInjector(t *testing.T) {
+	// Bare calls without a preceding use/import should not be captured
+	path := writeTempFile(t, `defmodule MyApp.NoUse do
+  embedded_schema do
+    field :name, :string
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Kind == "call" && r.Function == "embedded_schema" {
+			t.Errorf("should not capture bare call without a use/import injector, got %+v", r)
+		}
+	}
+}
+
+func filterRefs(refs []Reference, kind string) []Reference {
+	var out []Reference
+	for _, r := range refs {
+		if r.Kind == kind {
+			out = append(out, r)
+		}
+	}
+	return out
 }

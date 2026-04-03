@@ -40,13 +40,21 @@ type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
 	projectRoot     string
+	explicitRoot    bool // true when projectRoot was provided via CLI, not inferred from Initialize
 	stdlibRoot      string
 	initialized     bool
 	client          protocol.Client
 	followDelegates bool
+	debug           bool
 
 	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
 	usingCacheMu sync.RWMutex
+}
+
+func (s *Server) debugf(format string, args ...interface{}) {
+	if s.debug {
+		log.Printf("[debug] "+format, args...)
+	}
 }
 
 func NewServer(s *store.Store, projectRoot string) *Server {
@@ -54,6 +62,7 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		store:           s,
 		docs:            NewDocumentStore(),
 		projectRoot:     projectRoot,
+		explicitRoot:    projectRoot != "",
 		followDelegates: true,
 		usingCache:      make(map[string]*usingCacheEntry),
 	}
@@ -104,7 +113,7 @@ func (s *Server) backgroundReindex() {
 		}
 
 		seen := make(map[string]struct{})
-		walkAndIndex := func(root string) {
+		walkAndIndex := func(root string, indexRefs bool) {
 			_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
 				seen[path] = struct{}{}
 
@@ -120,11 +129,14 @@ func (s *Server) backgroundReindex() {
 					}
 				}
 
-				defs, err := parser.ParseFile(path)
+				defs, refs, err := parser.ParseFile(path)
 				if err != nil {
 					return nil
 				}
-				if err := s.store.IndexFile(path, defs); err != nil {
+				if !indexRefs {
+					refs = nil
+				}
+				if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 					log.Printf("Warning: reindex %s: %v", path, err)
 				}
 				reindexed++
@@ -132,10 +144,12 @@ func (s *Server) backgroundReindex() {
 			})
 		}
 
-		walkAndIndex(s.projectRoot)
+		walkAndIndex(s.projectRoot, true)
 
 		if s.stdlibRoot != "" {
-			walkAndIndex(s.stdlibRoot)
+			// Skip reference indexing for stdlib — we only need definitions
+			// from stdlib, and references within stdlib are not useful to users.
+			walkAndIndex(s.stdlibRoot, false)
 		}
 
 		// Prune store entries for files no longer on disk
@@ -207,15 +221,17 @@ func (s *Server) periodicReindex() {
 // === LSP Lifecycle ===
 
 func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
-	if len(params.WorkspaceFolders) > 0 {
-		root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
-		if root != "" {
-			s.projectRoot = findDexterRoot(root)
-		}
-	} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
-		root := uriToPath(params.RootURI) //nolint:staticcheck
-		if root != "" {
-			s.projectRoot = findDexterRoot(root)
+	if !s.explicitRoot {
+		if len(params.WorkspaceFolders) > 0 {
+			root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
+			if root != "" {
+				s.projectRoot = findDexterRoot(root)
+			}
+		} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
+			root := uriToPath(params.RootURI) //nolint:staticcheck
+			if root != "" {
+				s.projectRoot = findDexterRoot(root)
+			}
 		}
 	}
 
@@ -227,7 +243,15 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		if v, ok := opts["stdlibPath"].(string); ok {
 			explicitStdlibPath = v
 		}
+		if v, ok := opts["debug"].(bool); ok {
+			s.debug = v
+		}
 	}
+	if os.Getenv("DEXTER_DEBUG") == "true" {
+		s.debug = true
+	}
+
+	log.Printf("Initialize: projectRoot=%s debug=%v", s.projectRoot, s.debug)
 
 	if root, ok := stdlib.Resolve(s.store, explicitStdlibPath); ok {
 		s.stdlibRoot = root
@@ -259,6 +283,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 				},
 			},
 			DefinitionProvider: true,
+			ReferencesProvider: true,
 			HoverProvider:      true,
 			CompletionProvider: &protocol.CompletionOptions{
 				TriggerCharacters: []string{"."},
@@ -332,12 +357,12 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 	}
 
 	go func() {
-		defs, err := parser.ParseFile(path)
+		defs, refs, err := parser.ParseFile(path)
 		if err != nil {
 			log.Printf("Error parsing %s: %v", path, err)
 			return
 		}
-		if err := s.store.IndexFile(path, defs); err != nil {
+		if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 			log.Printf("Error indexing %s: %v", path, err)
 		}
 	}()
@@ -422,6 +447,16 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		// Check use-injected imports and inline defs
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			return storeResultsToLocations(results), nil
+		}
+
+		// Fallback: try the use'd modules themselves directly. Handles DSL macros
+		// (e.g. Ecto.Schema.field) that are available inside macro-injected blocks
+		// but not explicitly listed in the module's __using__ imports.
+		for _, usedMod := range ExtractUses(text) {
+			resolved := resolveModule(usedMod, aliases)
+			if results, err := s.store.LookupFollowDelegate(resolved, functionName); err == nil && len(results) > 0 {
+				return storeResultsToLocations(results), nil
+			}
 		}
 
 		// Kernel is always imported — fall back to it last
@@ -831,6 +866,61 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, visited map
 	return nil
 }
 
+// resolveModuleViaUseChain returns the module name that provides functionName
+// through moduleName's __using__ chain (imports and transitive uses), or "" if
+// not found. Mirrors lookupInUsingEntry but returns the module rather than locations.
+func (s *Server) resolveModuleViaUseChain(moduleName, functionName string, visited map[string]bool) string {
+	if visited[moduleName] {
+		return ""
+	}
+	visited[moduleName] = true
+
+	entry := s.cachedUsing(moduleName)
+	if entry == nil {
+		return ""
+	}
+
+	for j := len(entry.imports) - 1; j >= 0; j-- {
+		results, err := s.store.LookupFunction(entry.imports[j], functionName)
+		if err == nil && len(results) > 0 {
+			return entry.imports[j]
+		}
+	}
+
+	for k := len(entry.transUses) - 1; k >= 0; k-- {
+		if mod := s.resolveModuleViaUseChain(entry.transUses[k], functionName, visited); mod != "" {
+			return mod
+		}
+	}
+
+	return ""
+}
+
+// usingChainImports returns true if moduleName's __using__ chain imports targetModule,
+// following both direct imports and transitive use chains to any depth.
+func (s *Server) usingChainImports(moduleName, targetModule string, visited map[string]bool) bool {
+	if visited[moduleName] {
+		return false
+	}
+	visited[moduleName] = true
+
+	entry := s.cachedUsing(moduleName)
+	if entry == nil {
+		return false
+	}
+	for _, imp := range entry.imports {
+		if imp == targetModule {
+			return true
+		}
+	}
+	for _, transUse := range entry.transUses {
+		if s.usingChainImports(transUse, targetModule, visited) {
+			return true
+		}
+	}
+	return false
+}
+
 // addCompletionsFromUsing adds completion items injected by a module's __using__
 // body — inline defs, imported functions, and transitive uses — into items.
 func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool) {
@@ -999,12 +1089,12 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 		switch change.Type {
 		case protocol.FileChangeTypeCreated, protocol.FileChangeTypeChanged:
 			go func(filePath string) {
-				defs, err := parser.ParseFile(filePath)
+				defs, refs, err := parser.ParseFile(filePath)
 				if err != nil {
 					log.Printf("Error parsing %s: %v", filePath, err)
 					return
 				}
-				if err := s.store.IndexFile(filePath, defs); err != nil {
+				if err := s.store.IndexFileWithRefs(filePath, defs, refs); err != nil {
 					log.Printf("Error indexing %s: %v", filePath, err)
 				}
 			}(path)
@@ -1148,7 +1238,188 @@ func (s *Server) RangeFormatting(ctx context.Context, params *protocol.DocumentR
 	return nil, nil
 }
 func (s *Server) References(ctx context.Context, params *protocol.ReferenceParams) ([]protocol.Location, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	s.debugf("References request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
+
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		s.debugf("References: document not found in store")
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	if lineNum >= len(lines) {
+		s.debugf("References: line %d out of range (total %d)", lineNum, len(lines))
+		return nil, nil
+	}
+
+	expr := ExtractExpression(lines[lineNum], col)
+	if expr == "" {
+		s.debugf("References: no expression at cursor")
+		return nil, nil
+	}
+
+	if strings.Contains(expr, "__MODULE__") {
+		for _, l := range lines {
+			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
+				expr = strings.ReplaceAll(expr, "__MODULE__", m[1])
+				break
+			}
+		}
+	}
+
+	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	aliases := ExtractAliases(text)
+	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
+
+	var fullModule string
+
+	if moduleRef == "" {
+		if functionName == "" {
+			s.debugf("References: no module or function")
+			return nil, nil
+		}
+
+		// Bare function — resolve to its defining module via imports/use
+		imports := ExtractImports(text)
+		for _, mod := range imports {
+			results, err := s.store.LookupFunction(mod, functionName)
+			if err == nil && len(results) > 0 {
+				fullModule = mod
+				s.debugf("References: resolved bare %q via import %q", functionName, mod)
+				break
+			}
+		}
+
+		if fullModule == "" {
+			// Check use-injected modules — use the same recursive chain resolution
+			// as go-to-definition (follows transUses, not just direct imports).
+			if defResults := s.lookupThroughUse(text, functionName, aliases); len(defResults) > 0 {
+				// lookupThroughUse returns definition locations; recover the module
+				// by looking up which module owns this definition.
+				for _, usedMod := range ExtractUses(text) {
+					resolved := resolveModule(usedMod, aliases)
+					visited := make(map[string]bool)
+					if mod := s.resolveModuleViaUseChain(resolved, functionName, visited); mod != "" {
+						fullModule = mod
+						s.debugf("References: resolved bare %q via use chain -> %q", functionName, mod)
+						break
+					}
+				}
+			}
+		}
+
+		if fullModule == "" {
+			// Check current module — cursor may be on a definition
+			for _, l := range lines {
+				if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
+					results, err := s.store.LookupFunction(m[1], functionName)
+					if err == nil && len(results) > 0 {
+						fullModule = m[1]
+						s.debugf("References: resolved bare %q via current module %q", functionName, fullModule)
+						break
+					}
+				}
+			}
+		}
+
+		if fullModule == "" {
+			// Kernel fallback
+			results, err := s.store.LookupFunction("Kernel", functionName)
+			if err == nil && len(results) > 0 {
+				fullModule = "Kernel"
+				s.debugf("References: resolved bare %q via Kernel", functionName)
+			}
+		}
+
+		if fullModule == "" {
+			s.debugf("References: could not resolve bare function %q", functionName)
+			return nil, nil
+		}
+	} else {
+		fullModule = resolveModule(moduleRef, aliases)
+		s.debugf("References: resolved module %q -> %q", moduleRef, fullModule)
+	}
+
+	t0 := time.Now()
+	s.debugf("References: looking up refs for %s.%s", fullModule, functionName)
+	refResults, err := s.store.LookupReferences(fullModule, functionName)
+	if err != nil {
+		s.debugf("References: store error: %v", err)
+		return nil, nil
+	}
+	s.debugf("References: direct lookup: %d results (%s)", len(refResults), time.Since(t0).Round(time.Microsecond))
+
+	// Also find refs attributed to modules whose __using__ transitively imports
+	// fullModule — following both direct imports and transitive use chains,
+	// matching the same logic as lookupInUsingEntry for go-to-definition.
+	if functionName != "" {
+		t1 := time.Now()
+		callerModules, err := s.store.ListCallerModulesForFunction(functionName)
+		s.debugf("References: ListCallerModulesForFunction: %d modules (%s)", len(callerModules), time.Since(t1).Round(time.Microsecond))
+		if err == nil {
+			visited := make(map[string]bool)
+			for _, mod := range callerModules {
+				if mod == fullModule {
+					continue
+				}
+				if s.usingChainImports(mod, fullModule, visited) {
+					transitive, err := s.store.LookupReferences(mod, functionName)
+					if err == nil {
+						refResults = append(refResults, transitive...)
+						s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
+					}
+				}
+			}
+		}
+	}
+	s.debugf("References: total lookup: %s", time.Since(t0).Round(time.Microsecond))
+
+	// Deduplicate by file+line (multiple injector modules may attribute the same call)
+	type refKey struct {
+		filePath string
+		line     int
+	}
+	seen := make(map[refKey]struct{}, len(refResults))
+
+	// Filter out stdlib paths
+	var locations []protocol.Location
+	for _, r := range refResults {
+		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+			continue
+		}
+		k := refKey{r.FilePath, r.Line}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		locations = append(locations, protocol.Location{
+			URI:   uri.File(r.FilePath),
+			Range: lineRange(r.Line - 1),
+		})
+	}
+
+	// Include declaration if requested
+	if params.Context.IncludeDeclaration {
+		defResults, err := s.store.LookupFunction(fullModule, functionName)
+		if err == nil {
+			for _, r := range defResults {
+				if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+					continue
+				}
+				locations = append(locations, protocol.Location{
+					URI:   uri.File(r.FilePath),
+					Range: lineRange(r.Line - 1),
+				})
+			}
+		}
+	}
+
+	s.debugf("References: returning %d locations", len(locations))
+	return locations, nil
 }
 func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
 	return nil, nil

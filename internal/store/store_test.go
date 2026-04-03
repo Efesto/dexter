@@ -41,7 +41,7 @@ func TestIndexAndLookupModule(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestIndexAndLookupFunction(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestLookupFunctionOrdersFunctionsBeforeTypes(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestReindexUpdatesDefinitions(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ end
 end
 `)
 
-	defs, err = parser.ParseFile(path)
+	defs, _, err = parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestRemoveFile(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestMtimeTracking(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ defmodule MyApp.Repo do
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ end
 		implPath := writeElixirFile(t, dir, "lib/impl.ex", `defimpl Jason.Encoder, for: MyApp.Handlers do
 end
 `)
-		implDefs, err := parser.ParseFile(implPath)
+		implDefs, _, err := parser.ParseFile(implPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -361,7 +361,7 @@ func TestListModuleFunctions(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ end
 end
 `)
 
-		multiDefs, err := parser.ParseFile(multiPath)
+		multiDefs, _, err := parser.ParseFile(multiPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -456,7 +456,7 @@ func TestMultipleFunctionHeadsLookup(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,6 +473,136 @@ end
 	}
 	if results[0].Line != 2 || results[1].Line != 6 {
 		t.Errorf("unexpected lines: %d, %d", results[0].Line, results[1].Line)
+	}
+}
+
+func TestIndexAndLookupReferences(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  alias MyApp.Repo
+
+  def list do
+    Repo.all(MyApp.User)
+  end
+end
+`)
+
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	// Look up references to MyApp.Repo
+	results, err := s.LookupReferences("MyApp.Repo", "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 reference to MyApp.Repo.all, got %d", len(results))
+	}
+	if results[0].FilePath != path || results[0].Line != 5 {
+		t.Errorf("unexpected result: %+v", results[0])
+	}
+
+	// Module-only lookup (alias reference)
+	modResults, err := s.LookupReferences("MyApp.Repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should include the alias line and the Repo.all call
+	if len(modResults) < 1 {
+		t.Errorf("expected at least 1 module-level reference, got %d", len(modResults))
+	}
+}
+
+func TestReindexClearsOldRefs(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/foo.ex", `defmodule Foo do
+  def bar, do: MyApp.Repo.all(MyApp.User)
+end
+`)
+
+	defs, refs, _ := parser.ParseFile(path)
+	_ = s.IndexFileWithRefs(path, defs, refs)
+
+	results, _ := s.LookupReferences("MyApp.Repo", "all")
+	if len(results) != 1 {
+		t.Fatalf("expected 1 ref before reindex, got %d", len(results))
+	}
+
+	// Rewrite without the reference
+	writeElixirFile(t, dir, "lib/foo.ex", `defmodule Foo do
+  def bar, do: :ok
+end
+`)
+
+	defs, refs, _ = parser.ParseFile(path)
+	_ = s.IndexFileWithRefs(path, defs, refs)
+
+	results, _ = s.LookupReferences("MyApp.Repo", "all")
+	if len(results) != 0 {
+		t.Errorf("expected 0 refs after reindex, got %d", len(results))
+	}
+}
+
+func TestLookupReferencesIncludesBareMacroCalls(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	// File that defines the macro
+	defPath := writeElixirFile(t, dir, "lib/schema.ex", `defmodule MyApp.EctoSchema do
+  defmacro embedded_schema(do: block) do
+    quote do: unquote(block)
+  end
+end
+`)
+
+	// File that calls the macro without module prefix (injected via use)
+	callerPath := writeElixirFile(t, dir, "lib/user.ex", `defmodule MyApp.User do
+  use MyApp.EctoSchema
+
+  embedded_schema do
+    field :name, :string
+  end
+end
+`)
+
+	defDefs, defRefs, err := parser.ParseFile(defPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerDefs, callerRefs, err := parser.ParseFile(callerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.IndexFileWithRefs(defPath, defDefs, defRefs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(callerPath, callerDefs, callerRefs); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := s.LookupReferences("MyApp.EctoSchema", "embedded_schema")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var found bool
+	for _, r := range results {
+		if r.FilePath == callerPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected bare call to embedded_schema in %s, got results: %v", callerPath, results)
 	}
 }
 
@@ -497,11 +627,11 @@ end
 end
 `)
 
-	defsA, err := parser.ParseFile(pathA)
+	defsA, _, err := parser.ParseFile(pathA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defsB, err := parser.ParseFile(pathB)
+	defsB, _, err := parser.ParseFile(pathB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +689,7 @@ func TestBatchIndexFileWithMtime(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +736,7 @@ func TestBatchRollback(t *testing.T) {
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +788,7 @@ defmodule MyApp.Schema do
 end
 `)
 
-	defs, err := parser.ParseFile(path)
+	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -762,5 +892,19 @@ func TestStdlibRoot(t *testing.T) {
 	root, _ = s.GetStdlibRoot()
 	if root != "/new/path" {
 		t.Errorf("got %q after overwrite, want %q", root, "/new/path")
+	}
+}
+
+func TestOpenCorruptedDB(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".dexter.db")
+
+	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Open(dir)
+	if err == nil {
+		t.Fatal("expected Open to fail on a corrupted DB file, got nil")
 	}
 }

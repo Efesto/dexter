@@ -43,11 +43,11 @@ func indexFile(t *testing.T, s *store.Store, dir, relPath, content string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
-	defs, err := parser.ParseFile(path)
+	defs, refs, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.IndexFile(path, defs); err != nil {
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -251,6 +251,21 @@ func definitionAt(t *testing.T, server *Server, uri string, line, col uint32) []
 			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
 			Position:     protocol.Position{Line: line, Character: col},
 		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func referencesAt(t *testing.T, server *Server, uri string, line, col uint32) []protocol.Location {
+	t.Helper()
+	result, err := server.References(context.Background(), &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: line, Character: col},
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: false},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -899,7 +914,7 @@ end
 		t.Fatal(err)
 	}
 
-	defs, err := parser.ParseFile(stdlibFile)
+	defs, _, err := parser.ParseFile(stdlibFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -942,7 +957,7 @@ end
 		t.Fatal(err)
 	}
 
-	defs, err := parser.ParseFile(stdlibFile)
+	defs, _, err := parser.ParseFile(stdlibFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1114,6 +1129,240 @@ end`)
 	locs := definitionAt(t, server, uri, 2, 5)
 	if len(locs) == 0 {
 		t.Fatal("expected definition for Kernel auto-imported to_timeout")
+	}
+}
+
+func TestDefinition_UsingInDocstring(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: parseUsingBody was matching `defmacro __using__` inside @moduledoc
+	// example code (heredoc) before finding the real implementation, causing
+	// cachedUsing to return stale/wrong data and go-to-definition to fail.
+	macroProviderSrc := `defmodule MyApp.MacroProvider do
+  def embedded_schema(block), do: block
+end`
+	schemaBaseSrc := `defmodule MyApp.SchemaBase do
+  @moduledoc """
+  Example usage:
+
+      defmodule MyApp.Schema do
+        defmacro __using__(_) do
+          quote do
+            use MyApp.SchemaBase
+          end
+        end
+      end
+
+  """
+
+  defmacro __using__(_) do
+    quote do
+      import MyApp.MacroProvider
+    end
+  end
+end`
+	callerSrc := `defmodule MyApp.Record do
+  use MyApp.SchemaBase
+
+  embedded_schema do
+    :ok
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/macro_provider.ex", macroProviderSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/schema_base.ex", schemaBaseSrc)
+	schemaBaseURI := "file://" + filepath.Join(server.projectRoot, "lib/schema_base.ex")
+	server.docs.Set(schemaBaseURI, schemaBaseSrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/record.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	// col=2 is on 'embedded_schema' (line 3 in callerSrc, 0-indexed)
+	locs := definitionAt(t, server, callerURI, 3, 2)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for bare macro call; __using__ in docstring should not shadow real __using__")
+	}
+}
+
+func TestDefinition_BareTypeReference(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: bare type references (e.g. charge_type()) inside the same module
+	// were not resolved because FindFunctionDefinition only checked FuncDefRe, not TypeDefRe.
+	src := `defmodule MyApp.Payment do
+  @type charge_type :: :OUR | :BEN | :SHA
+
+  @type params :: %{
+    required(:charge) => charge_type()
+  }
+end`
+	fileURI := "file:///test.ex"
+	server.docs.Set(fileURI, src)
+
+	// col=26 is on 'charge_type' in the @type params line (line 4)
+	locs := definitionAt(t, server, fileURI, 4, 26)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for bare type reference charge_type()")
+	}
+	// Should jump to the @type charge_type definition on line 1 (0-indexed)
+	if locs[0].Range.Start.Line != 1 {
+		t.Errorf("expected jump to @type charge_type on line 1, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestDefinition_BareTypeReferenceInStructType(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: bare type reference inside a struct type definition.
+	src := `defmodule MyApp.Order do
+  @type status :: :pending | :complete
+
+  @type t :: %__MODULE__{
+    status: status()
+  }
+end`
+	fileURI := "file:///order.ex"
+	server.docs.Set(fileURI, src)
+
+	// col=13 is on 'status' in the @type t definition (line 4)
+	locs := definitionAt(t, server, fileURI, 4, 13)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for bare type reference status()")
+	}
+	if locs[0].Range.Start.Line != 1 {
+		t.Errorf("expected jump to @type status on line 1, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestReferences_TransitiveUseChain(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// The macro provider defines `special_field` as a macro.
+	macroProviderSrc := `defmodule MyApp.MacroProvider do
+  defmacro special_field(name, type) do
+    quote do: :ok
+  end
+end`
+
+	// The base worker injects the macro provider via its __using__.
+	baseWorkerSrc := `defmodule MyApp.BaseWorker do
+  defmacro __using__(_opts) do
+    quote do
+      import MyApp.MacroProvider
+    end
+  end
+end`
+
+	// The concrete worker uses BaseWorker, making special_field available.
+	workerSrc := `defmodule MyApp.ConcreteWorker do
+  use MyApp.BaseWorker
+
+  special_field :name, :string
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/macro_provider.ex", macroProviderSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/base_worker.ex", baseWorkerSrc)
+	workerPath := filepath.Join(server.projectRoot, "lib/worker.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/worker.ex", workerSrc)
+
+	macroProviderURI := "file://" + filepath.Join(server.projectRoot, "lib/macro_provider.ex")
+	server.docs.Set(macroProviderURI, macroProviderSrc)
+	baseWorkerURI := "file://" + filepath.Join(server.projectRoot, "lib/base_worker.ex")
+	server.docs.Set(baseWorkerURI, baseWorkerSrc)
+	workerURI := "file://" + filepath.Join(server.projectRoot, "lib/worker.ex")
+	server.docs.Set(workerURI, workerSrc)
+
+	// Hovering on `special_field` at line 1 of macro_provider.ex (col on the name)
+	locs := referencesAt(t, server, macroProviderURI, 1, 13)
+	if len(locs) == 0 {
+		t.Fatal("expected references for special_field via transitive use chain")
+	}
+	found := false
+	for _, loc := range locs {
+		if strings.Contains(string(loc.URI), "worker.ex") && loc.Range.Start.Line == 3 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected worker.ex:3 in references, got: %v", locs)
+	}
+	_ = workerPath
+}
+
+func TestReferences_DeepTransitiveUseChain(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: `use A` → A.__using__ calls `use B` → B.__using__ calls `use C`
+	// → C defines a macro. go-to-references on C.macro should find callers even
+	// when the use chain is 3 hops deep.
+	definerSrc := `defmodule MyApp.MacroDefs do
+  defmacro schema_field(name) do
+    quote do: :ok
+  end
+end`
+	levelCSrc := `defmodule MyApp.Level.C do
+  defmacro __using__(_) do
+    quote do
+      import MyApp.MacroDefs
+    end
+  end
+end`
+	levelBSrc := `defmodule MyApp.Level.B do
+  defmacro __using__(_) do
+    quote do
+      use MyApp.Level.C
+    end
+  end
+end`
+	levelASrc := `defmodule MyApp.Level.A do
+  defmacro __using__(_) do
+    quote do
+      use MyApp.Level.B
+    end
+  end
+end`
+	callerSrc := `defmodule MyApp.Caller do
+  use MyApp.Level.A
+
+  schema_field :name
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/macro_defs.ex", definerSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/level_c.ex", levelCSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/level_b.ex", levelBSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/level_a.ex", levelASrc)
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerSrc)
+
+	definerURI := "file://" + filepath.Join(server.projectRoot, "lib/macro_defs.ex")
+	server.docs.Set(definerURI, definerSrc)
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/caller.ex")
+	server.docs.Set(callerURI, callerSrc)
+	for _, f := range []struct{ uri, src string }{
+		{"file://" + filepath.Join(server.projectRoot, "lib/level_c.ex"), levelCSrc},
+		{"file://" + filepath.Join(server.projectRoot, "lib/level_b.ex"), levelBSrc},
+		{"file://" + filepath.Join(server.projectRoot, "lib/level_a.ex"), levelASrc},
+	} {
+		server.docs.Set(f.uri, f.src)
+	}
+
+	// col=13 is on `schema_field` definition in macro_defs.ex (line 1)
+	locs := referencesAt(t, server, definerURI, 1, 13)
+	if len(locs) == 0 {
+		t.Fatal("expected references for schema_field via 3-hop transitive use chain")
+	}
+	found := false
+	for _, loc := range locs {
+		if strings.Contains(string(loc.URI), "caller.ex") && loc.Range.Start.Line == 3 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected caller.ex:3 in references for deep transitive use chain, got: %v", locs)
 	}
 }
 

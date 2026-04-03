@@ -275,7 +275,19 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 
 	usingIdx := -1
 	usingIndent := 0
+	inHeredoc := false
 	for i, line := range lines {
+		if strings.IndexByte(line, '"') >= 0 {
+			if count := strings.Count(line, `"""`); count > 0 {
+				if count < 2 {
+					inHeredoc = !inHeredoc
+				}
+				continue
+			}
+		}
+		if inHeredoc {
+			continue
+		}
 		if usingDefRe.MatchString(line) {
 			usingIdx = i
 			usingIndent = len(line) - len(strings.TrimLeft(line, " \t"))
@@ -417,6 +429,12 @@ func FindModuleAttributeDefinition(text string, attrName string) (int, bool) {
 func FindFunctionDefinition(text string, functionName string) (int, bool) {
 	for i, line := range strings.Split(text, "\n") {
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
+			if m[2] == functionName {
+				return i + 1, true
+			}
+			continue // FuncDefRe and TypeDefRe match different line prefixes
+		}
+		if m := parser.TypeDefRe.FindStringSubmatch(line); m != nil {
 			if m[2] == functionName {
 				return i + 1, true
 			}

@@ -42,7 +42,7 @@ Add to your LSP configuration (e.g., `after/plugin/lsp.lua`):
 vim.lsp.config('dexter', {
   cmd = { 'dexter', 'lsp' },
   root_markers = { '.dexter.db', '.git', 'mix.exs' },
-  filetypes = { 'elixir', 'eelixir' },
+  filetypes = { 'elixir', 'eelixir', 'heex' },
   init_options = {
     followDelegates = true,  -- jump through defdelegate to the target function
     -- stdlibPath = "",      -- override Elixir stdlib path (auto-detected)
@@ -53,7 +53,7 @@ vim.lsp.config('dexter', {
 vim.lsp.enable 'dexter'
 ```
 
-That's it. Go-to-definition (`gd`, `<C-]>`, or whatever you have mapped to `vim.lsp.buf.definition()`) will now use dexter alongside any other attached LSP servers.
+That's it. Go-to-definition (`gd`, `<C-]>`, or whatever you have mapped to `vim.lsp.buf.definition()`) will now use dexter alongside any other attached LSP servers. Formatting happens automatically on save — no `BufWritePre` autocommand needed.
 
 If you want a dedicated binding just for dexter:
 
@@ -267,7 +267,9 @@ Dexter reads `initializationOptions` from your editor configuration:
 
 ## Formatting
 
-Dexter provides `textDocument/formatting` via `mix format`. To enable format-on-save, configure your editor to call formatting before save (e.g. `editor.formatOnSave` in VS Code, or a `BufWritePre` autocmd in Neovim).
+Dexter automatically formats Elixir files on save via `mix format`. Formatting runs asynchronously — saves are never blocked, and the formatted result is pushed back to the editor via `workspace/applyEdit` when ready. If the buffer changes while formatting is in progress, the stale result is discarded.
+
+Manual formatting is also available via `textDocument/formatting` (e.g. `:lua vim.lsp.buf.format()` in Neovim). No editor-side format-on-save config is needed.
 
 Formatting uses the nearest `mix.exs` ancestor of the file being formatted to find the correct `.formatter.exs` — this means it works correctly in monorepos where subprojects may have different formatter configs.
 

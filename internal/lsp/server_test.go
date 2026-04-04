@@ -29,6 +29,11 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 
 	server := NewServer(s, dir)
 
+	// Resolve the mix binary so formatting tests work
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
 	return server, func() {
 		if err := s.Close(); err != nil {
 			t.Errorf("failed to close store: %v", err)
@@ -1860,12 +1865,12 @@ func TestFindMixRoot(t *testing.T) {
 	//   root/my_app/lib/
 	//   root/other_project/mix.exs
 	//   root/other_project/lib/
-	my_app := filepath.Join(root, "my_app")
-	if err := os.MkdirAll(filepath.Join(my_app, "lib"), 0755); err != nil {
+	myApp := filepath.Join(root, "my_app")
+	if err := os.MkdirAll(filepath.Join(myApp, "lib"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	my_appMix := filepath.Join(my_app, "mix.exs")
-	if err := os.WriteFile(my_appMix, []byte(""), 0644); err != nil {
+	myAppMix := filepath.Join(myApp, "mix.exs")
+	if err := os.WriteFile(myAppMix, []byte(""), 0644); err != nil {
 		t.Fatal(err)
 	}
 	otherProject := filepath.Join(root, "other_project")
@@ -1878,16 +1883,16 @@ func TestFindMixRoot(t *testing.T) {
 	}
 
 	t.Run("finds nearest mix.exs from project lib dir", func(t *testing.T) {
-		got := findMixRoot(filepath.Join(my_app, "lib"))
-		if got != my_app {
-			t.Errorf("expected %s, got %s", my_app, got)
+		got := findMixRoot(filepath.Join(myApp, "lib"))
+		if got != myApp {
+			t.Errorf("expected %s, got %s", myApp, got)
 		}
 	})
 
 	t.Run("finds mix.exs in same directory", func(t *testing.T) {
-		got := findMixRoot(my_app)
-		if got != my_app {
-			t.Errorf("expected %s, got %s", my_app, got)
+		got := findMixRoot(myApp)
+		if got != myApp {
+			t.Errorf("expected %s, got %s", myApp, got)
 		}
 	})
 
@@ -1941,6 +1946,175 @@ func TestFormatting_NoMixProject(t *testing.T) {
 	}
 	if edits != nil {
 		t.Error("expected nil edits when no mix.exs exists")
+	}
+}
+
+func TestFormatter_PersistentProcessReuse(t *testing.T) {
+	_, err := exec.LookPath("mix")
+	if err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	if err := os.WriteFile(filepath.Join(server.projectRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(server.projectRoot, "lib", "test.ex")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, "defmodule   Test   do\nend\n")
+
+	// First format — starts the persistent process
+	edits1, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits1 == nil {
+		t.Fatal("expected edits from first format")
+	}
+
+	// Second format — should reuse the same process (much faster)
+	server.docs.Set(docURI, "defmodule   Test2   do\nend\n")
+	start := time.Now()
+	edits2, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits2 == nil {
+		t.Fatal("expected edits from second format")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("second format took %s, expected reuse of persistent process", elapsed)
+	}
+}
+
+func TestFormatter_RestartAfterCrash(t *testing.T) {
+	_, err := exec.LookPath("mix")
+	if err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	if err := os.WriteFile(filepath.Join(server.projectRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(server.projectRoot, "lib", "test.ex")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, "defmodule   Test   do\nend\n")
+
+	// Start the persistent process
+	_, err = server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Kill the persistent process
+	mixRoot := findMixRoot(filepath.Dir(filePath))
+	formatterExs := findFormatterConfig(filePath, mixRoot)
+	server.formattersMu.Lock()
+	if fp, ok := server.formatters[formatterExs]; ok {
+		fp.Close()
+	}
+	server.formattersMu.Unlock()
+
+	// Next format should recover (restart or fall back)
+	server.docs.Set(docURI, "defmodule   Test2   do\nend\n")
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting to recover after process crash")
+	}
+	if !strings.Contains(edits[0].NewText, "defmodule Test2 do") {
+		t.Errorf("unexpected format result: %s", edits[0].NewText)
+	}
+}
+
+func TestFormatter_WillSaveWaitUntil(t *testing.T) {
+	_, err := exec.LookPath("mix")
+	if err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	if err := os.WriteFile(filepath.Join(server.projectRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(server.projectRoot, "lib", "test.ex")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, "defmodule   Test   do\nend\n")
+
+	edits, err := server.WillSaveWaitUntil(context.Background(), &protocol.WillSaveTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected WillSaveWaitUntil to return formatting edits")
+	}
+	if !strings.Contains(edits[0].NewText, "defmodule Test do") {
+		t.Errorf("expected formatted output, got: %s", edits[0].NewText)
+	}
+}
+
+func TestFormatter_DidOpen_SkipsDepsFiles(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Create project root mix.exs so isDepsFile can detect deps/ relative to it
+	if err := os.WriteFile(filepath.Join(server.projectRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a deps structure: projectRoot/deps/some_dep/lib/foo.ex
+	depsDir := filepath.Join(server.projectRoot, "deps", "some_dep", "lib")
+	if err := os.MkdirAll(depsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	depFile := filepath.Join(depsDir, "foo.ex")
+	depURI := string(uri.File(depFile))
+
+	// Open a dep file — should NOT start a formatter process.
+	// We verify by checking that no goroutine was launched: isDepsFile
+	// returns true, so the eager-start path is skipped entirely.
+	_ = server.DidOpen(context.Background(), &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{
+			URI:  protocol.DocumentURI(depURI),
+			Text: "defmodule SomeDep.Foo do\nend\n",
+		},
+	})
+
+	server.formattersMu.Lock()
+	count := len(server.formatters)
+	server.formattersMu.Unlock()
+
+	if count != 0 {
+		t.Errorf("expected no formatter processes for dep file, got %d", count)
 	}
 }
 

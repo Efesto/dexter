@@ -52,7 +52,7 @@ test:integration:
     - cd internal/lsp/testdata/monorepo/apps/app_basic && mix deps.get && cd -
   script:
     - export PATH=$CI_PROJECT_DIR/.go/bin:$PATH
-    - go test ./internal/lsp/ -run 'TestFormatting_(WithStyler|BasicProject|BadIndentation|CacheInvalidation|DifferentProjects)' -v -timeout 120s
+    - go test ./internal/lsp/ -run 'TestFormatterServer_(WithStyler|BasicProject|BadIndentation|CacheInvalidation|DifferentProjects)' -v -timeout 120s
   tags:
     - size-m
   rules:

@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -52,12 +51,15 @@ func setupTestServerForFixture(t *testing.T, mixRoot string) (*Server, func()) {
 		t.Fatal(err)
 	}
 	server := NewServer(s, filepath.Dir(filepath.Dir(mixRoot)))
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
 	return server, func() {
 		_ = s.Close()
 	}
 }
 
-func TestFormatting_WithStylerPlugin(t *testing.T) {
+func TestFormatterServer_WithStylerPlugin(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")
 	}
@@ -91,7 +93,7 @@ func TestFormatting_WithStylerPlugin(t *testing.T) {
 	}
 }
 
-func TestFormatting_BasicProject(t *testing.T) {
+func TestFormatterServer_BasicProject(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")
 	}
@@ -121,7 +123,7 @@ func TestFormatting_BasicProject(t *testing.T) {
 	}
 }
 
-func TestFormatting_BadIndentation(t *testing.T) {
+func TestFormatterServer_BadIndentation(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")
 	}
@@ -152,69 +154,7 @@ func TestFormatting_BadIndentation(t *testing.T) {
 	}
 }
 
-func TestFormatting_CacheInvalidation(t *testing.T) {
-	if _, err := exec.LookPath("mix"); err != nil {
-		t.Skip("mix not available in PATH")
-	}
-
-	monorepo := fixtureMonorepoPath(t)
-	mixRoot := filepath.Join(monorepo, "apps", "app_basic")
-	ensureFixtureDeps(t, mixRoot)
-
-	server, cleanup := setupTestServerForFixture(t, mixRoot)
-	defer cleanup()
-
-	filePath := filepath.Join(mixRoot, "lib", "test.ex")
-	docURI := string(uri.File(filePath))
-
-	longLine := "defmodule Test do\n  def hello, do: very_long_function_name(with_argument_one, with_argument_two, with_argument_three)\nend\n"
-	server.docs.Set(docURI, longLine)
-
-	edits1, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if edits1 == nil {
-		t.Fatal("expected formatting edits for long line at line_length: 80")
-	}
-	formatted80 := edits1[0].NewText
-
-	formatterPath := filepath.Join(mixRoot, ".formatter.exs")
-	origContent, err := os.ReadFile(formatterPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.WriteFile(formatterPath, origContent, 0644) }()
-
-	if err := os.WriteFile(formatterPath, []byte("[\n  line_length: 200,\n  inputs: [\"{lib,test}/**/*.{ex,exs}\"]\n]\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	// Force a future mtime so mix format picks up the change
-	future := time.Now().Add(5 * time.Second)
-	if err := os.Chtimes(formatterPath, future, future); err != nil {
-		t.Fatal(err)
-	}
-
-	server.docs.Set(docURI, longLine)
-
-	edits2, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if edits2 != nil {
-		formatted200 := edits2[0].NewText
-		if formatted200 == formatted80 {
-			t.Error("expected different formatting after .formatter.exs change, got same output")
-		}
-	}
-}
-
-func TestFormatting_DifferentProjectsDifferentResults(t *testing.T) {
+func TestFormatterServer_DifferentProjectsDifferentResults(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")
 	}

@@ -2,9 +2,9 @@ package lsp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -51,6 +51,9 @@ type Server struct {
 	followDelegates bool
 	debug           bool
 	mixBin          string // resolved path to the mix binary
+
+	formatters   map[string]*formatterProcess // formatterExs path → persistent formatter
+	formattersMu sync.Mutex
 
 	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
 	usingCacheMu sync.RWMutex
@@ -319,8 +322,9 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	result := &protocol.InitializeResult{
 		Capabilities: protocol.ServerCapabilities{
 			TextDocumentSync: protocol.TextDocumentSyncOptions{
-				OpenClose: true,
-				Change:    protocol.TextDocumentSyncKindFull,
+				OpenClose:         true,
+				Change:            protocol.TextDocumentSyncKindFull,
+				WillSaveWaitUntil: true,
 				Save: &protocol.SaveOptions{
 					IncludeText: false,
 				},
@@ -380,6 +384,7 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.closeFormatters()
 	return nil
 }
 
@@ -392,6 +397,19 @@ func (s *Server) Exit(ctx context.Context) error {
 
 func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
 	s.docs.Set(string(params.TextDocument.URI), params.TextDocument.Text)
+
+	// Eagerly start the persistent formatter so the first format is instant.
+	// Skip deps and stdlib files — we don't format those.
+	path := uriToPath(params.TextDocument.URI)
+	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
+		go func() {
+			if mixRoot := findMixRoot(filepath.Dir(path)); mixRoot != "" {
+				formatterExs := findFormatterConfig(path, mixRoot)
+				_, _ = s.getFormatter(mixRoot, formatterExs)
+			}
+		}()
+	}
+
 	return nil
 }
 
@@ -432,6 +450,11 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 func (s *Server) isProjectFile(path string) bool {
 	cleaned := filepath.Clean(path)
 	return strings.HasPrefix(cleaned, s.projectRoot+string(os.PathSeparator))
+}
+
+func isFormattableFile(path string) bool {
+	ext := filepath.Ext(path)
+	return ext == ".ex" || ext == ".exs" || ext == ".heex"
 }
 
 func (s *Server) mixCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
@@ -2082,7 +2105,7 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]protocol.TextEdit, error) {
 	s.debugf("Formatting: request received for %s", params.TextDocument.URI)
 	path := uriToPath(params.TextDocument.URI)
-	if path == "" || !parser.IsElixirFile(path) || !s.isProjectFile(path) {
+	if path == "" || !isFormattableFile(path) || !s.isProjectFile(path) {
 		return nil, nil
 	}
 
@@ -2096,25 +2119,22 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 		return nil, nil
 	}
 
-	start := time.Now()
-	cmd := s.mixCommand(ctx, mixRoot, "format", "--stdin-filename", path, "-")
-	cmd.Stdin = strings.NewReader(text)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		log.Printf("Formatting: mix format failed for %s (%s): %v\n%s", path, time.Since(start), err, stderr.String())
+	formatted, err := s.formatContent(mixRoot, path, text)
+	if err != nil {
+		var formatErr *FormatError
+		if errors.As(err, &formatErr) {
+			s.publishFormatDiagnostic(params.TextDocument.URI, formatErr)
+		}
 		return nil, nil
 	}
 
-	formatted := stdout.String()
+	s.clearFormatDiagnostics(params.TextDocument.URI)
+
 	if formatted == text {
-		log.Printf("Formatting: %s already formatted (%s)", path, time.Since(start))
 		return nil, nil
 	}
 
 	lines := strings.Count(text, "\n") + 1
-	log.Printf("Formatting: %s changed (%s, %d bytes → %d bytes)", path, time.Since(start), len(text), len(formatted))
 	return []protocol.TextEdit{
 		{
 			Range: protocol.Range{
@@ -3633,7 +3653,9 @@ func (s *Server) WillSave(ctx context.Context, params *protocol.WillSaveTextDocu
 	return nil
 }
 func (s *Server) WillSaveWaitUntil(ctx context.Context, params *protocol.WillSaveTextDocumentParams) ([]protocol.TextEdit, error) {
-	return nil, nil
+	return s.Formatting(ctx, &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: params.TextDocument.URI},
+	})
 }
 func (s *Server) ShowDocument(ctx context.Context, params *protocol.ShowDocumentParams) (*protocol.ShowDocumentResult, error) {
 	return nil, nil

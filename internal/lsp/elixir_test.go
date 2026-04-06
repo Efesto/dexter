@@ -315,22 +315,22 @@ end
 
 	t.Run("nested module with conflicting alias", func(t *testing.T) {
 		conflictSrc := `defmodule MyApp.Payments do
-  defmodule PaymentRecord do
-    alias MyApp.Billing.PaymentRecord
+  defmodule TransactionRecord do
+    alias MyApp.Billing.TransactionRecord
     def schema, do: %{}
   end
 end
 `
-		// Line 3 = "def schema" inside the nested PaymentRecord
+		// Line 3 = "def schema" inside the nested TransactionRecord
 		aliases := ExtractAliasesInScope(conflictSrc, 3)
-		if aliases["PaymentRecord"] != "MyApp.Billing.PaymentRecord" {
-			t.Errorf("expected Billing alias inside nested module, got %q", aliases["PaymentRecord"])
+		if aliases["TransactionRecord"] != "MyApp.Billing.TransactionRecord" {
+			t.Errorf("expected Billing alias inside nested module, got %q", aliases["TransactionRecord"])
 		}
 
 		// Line 0 = "defmodule MyApp.Payments do" — outer scope has no aliases
 		aliases = ExtractAliasesInScope(conflictSrc, 0)
-		if _, ok := aliases["PaymentRecord"]; ok {
-			t.Error("PaymentRecord alias should NOT be visible in outer scope")
+		if _, ok := aliases["TransactionRecord"]; ok {
+			t.Error("TransactionRecord alias should NOT be visible in outer scope")
 		}
 	})
 }

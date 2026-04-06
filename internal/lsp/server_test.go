@@ -1946,28 +1946,28 @@ func TestReferences_NestedDefmoduleWithConflictingAlias(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	// The nested defmodule PaymentRecord creates MyApp.Payments.PaymentRecord,
-	// but inside it there's `alias MyApp.Billing.PaymentRecord` (a different module).
+	// The nested defmodule TransactionRecord creates MyApp.Payments.TransactionRecord,
+	// but inside it there's `alias MyApp.Billing.TransactionRecord` (a different module).
 	// Go-to-references on the defmodule line should find references to the API module,
 	// NOT the billing module.
 	defSrc := `defmodule MyApp.Payments do
-  defmodule PaymentRecord do
-    alias MyApp.Billing.PaymentRecord
+  defmodule TransactionRecord do
+    alias MyApp.Billing.TransactionRecord
 
     def schema, do: %{}
   end
 end
 `
 	callerSrc := `defmodule MyApp.Web do
-  alias MyApp.Payments.PaymentRecord
+  alias MyApp.Payments.TransactionRecord
 
   def show do
-    PaymentRecord.schema()
+    TransactionRecord.schema()
   end
 end
 `
 	// Also index the billing module so the alias has a target
-	billingSrc := `defmodule MyApp.Billing.PaymentRecord do
+	billingSrc := `defmodule MyApp.Billing.TransactionRecord do
   def get(id), do: id
 end
 `
@@ -1979,11 +1979,11 @@ end
 	defURI := "file://" + defPath
 	server.docs.Set(defURI, defSrc)
 
-	// Go-to-references on "PaymentRecord" in the defmodule line (line 1, col 13)
+	// Go-to-references on "TransactionRecord" in the defmodule line (line 1, col 13)
 	locs := referencesAt(t, server, defURI, 1, 13)
 
-	// Should find references to MyApp.Payments.PaymentRecord (the API module),
-	// NOT MyApp.Billing.PaymentRecord
+	// Should find references to MyApp.Payments.TransactionRecord (the API module),
+	// NOT MyApp.Billing.TransactionRecord
 	foundWebRef := false
 	foundBillingRef := false
 	for _, loc := range locs {
@@ -1996,10 +1996,10 @@ end
 		}
 	}
 	if !foundWebRef {
-		t.Error("expected reference in web.ex for the API PaymentRecord module")
+		t.Error("expected reference in web.ex for the API TransactionRecord module")
 	}
 	if foundBillingRef {
-		t.Error("should NOT return references to MyApp.Billing.PaymentRecord")
+		t.Error("should NOT return references to MyApp.Billing.TransactionRecord")
 	}
 }
 

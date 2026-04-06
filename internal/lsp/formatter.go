@@ -24,12 +24,25 @@ import (
 //go:embed formatter_server.exs
 var formatterScript string
 
+const (
+	// How long to wait for the persistent formatter to become ready before
+	// falling back to mix format on a given request.
+	formatterWaitTimeout = 5 * time.Second
+	// How long a not-ready formatter process is allowed to live before being
+	// killed and restarted. Also used as the hard cap inside the startup
+	// goroutine to prevent leaked goroutines.
+	formatterStuckTimeout = 30 * time.Second
+)
+
 type formatterProcess struct {
 	cmd            *commandHandle
 	stdin          io.WriteCloser
 	stdout         io.ReadCloser
 	mu             sync.Mutex
-	formatterMtime time.Time // mtime of .formatter.exs when process started
+	formatterMtime time.Time     // mtime of .formatter.exs when process started
+	startedAt      time.Time     // when the process was launched
+	ready          chan struct{} // closed when the BEAM has sent the ready signal
+	startErr       error         // non-nil if startup failed; set before ready is closed
 }
 
 // commandHandle wraps the process so we can check liveness.
@@ -47,7 +60,18 @@ func (fp *formatterProcess) alive() bool {
 	}
 }
 
-func (fp *formatterProcess) Format(content, filename string) (string, error) {
+// Ready blocks until the process has finished startup. Returns startErr if
+// the BEAM failed to initialize, or ctx.Err() if the caller gives up first.
+func (fp *formatterProcess) Ready(ctx context.Context) error {
+	select {
+	case <-fp.ready:
+		return fp.startErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (fp *formatterProcess) Format(ctx context.Context, content, filename string) (string, error) {
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
 
@@ -63,23 +87,44 @@ func (fp *formatterProcess) Format(content, filename string) (string, error) {
 		return "", fmt.Errorf("write request: %w", err)
 	}
 
-	var status byte
-	if err := binary.Read(fp.stdout, binary.BigEndian, &status); err != nil {
-		return "", fmt.Errorf("read status: %w", err)
+	type readResult struct {
+		text string
+		err  error
 	}
-	var respLen uint32
-	if err := binary.Read(fp.stdout, binary.BigEndian, &respLen); err != nil {
-		return "", fmt.Errorf("read length: %w", err)
-	}
-	buf := make([]byte, respLen)
-	if _, err := io.ReadFull(fp.stdout, buf); err != nil {
-		return "", fmt.Errorf("read data: %w", err)
-	}
+	ch := make(chan readResult, 1)
+	go func() {
+		var status byte
+		if err := binary.Read(fp.stdout, binary.BigEndian, &status); err != nil {
+			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
+			return
+		}
+		var respLen uint32
+		if err := binary.Read(fp.stdout, binary.BigEndian, &respLen); err != nil {
+			ch <- readResult{err: fmt.Errorf("read length: %w", err)}
+			return
+		}
+		buf := make([]byte, respLen)
+		if _, err := io.ReadFull(fp.stdout, buf); err != nil {
+			ch <- readResult{err: fmt.Errorf("read data: %w", err)}
+			return
+		}
+		if status != 0 {
+			ch <- readResult{err: &FormatError{Message: string(buf)}}
+			return
+		}
+		ch <- readResult{text: string(buf)}
+	}()
 
-	if status != 0 {
-		return "", &FormatError{Message: string(buf)}
+	select {
+	case r := <-ch:
+		return r.text, r.err
+	case <-ctx.Done():
+		// Kill the process to unblock the reader goroutine — the pipe reads
+		// will fail once the process exits, preventing a leaked goroutine.
+		_ = fp.cmd.process.Kill()
+		<-ch
+		return "", ctx.Err()
 	}
-	return string(buf), nil
 }
 
 // FormatError represents a formatting failure (e.g. syntax error in the source).
@@ -97,6 +142,10 @@ func (fp *formatterProcess) Close() {
 	_ = fp.cmd.process.Kill()
 }
 
+// startFormatterProcess launches the BEAM process and returns immediately.
+// The returned process may not be ready yet — callers must check fp.Ready()
+// before calling fp.Format(). Returns error only for immediate launch failures
+// (missing binary, can't create pipes).
 func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatterProcess, error) {
 	scriptDir := filepath.Join(os.TempDir(), "dexter")
 	if err := os.MkdirAll(scriptDir, 0755); err != nil {
@@ -140,52 +189,62 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 
 	handle := &commandHandle{process: cmd.Process, done: done}
 
-	// Wait for ready signal with a timeout — if the BEAM doesn't respond
-	// within 10s, it's not going to.
-	type readyResult struct {
-		status byte
-		err    error
-	}
-	readyCh := make(chan readyResult, 1)
-	go func() {
-		var status byte
-		if err := binary.Read(stdout, binary.BigEndian, &status); err != nil {
-			readyCh <- readyResult{err: err}
-			return
-		}
-		var readyLen uint32
-		if err := binary.Read(stdout, binary.BigEndian, &readyLen); err != nil {
-			readyCh <- readyResult{err: err}
-			return
-		}
-		readyCh <- readyResult{status: status}
-	}()
-
-	select {
-	case r := <-readyCh:
-		if r.err != nil {
-			_ = cmd.Process.Kill()
-			return nil, fmt.Errorf("formatter ready: %w", r.err)
-		}
-		if r.status != 0 {
-			_ = cmd.Process.Kill()
-			return nil, fmt.Errorf("formatter failed to initialize (status %d)", r.status)
-		}
-	case <-time.After(10 * time.Second):
-		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("formatter startup timed out")
-	}
-
-	log.Printf("Formatter: started persistent process for %s (pid %d)", formatterExs, cmd.Process.Pid)
-
-	return &formatterProcess{
+	fp := &formatterProcess{
 		cmd:            handle,
 		stdin:          stdin,
 		stdout:         stdout,
 		formatterMtime: mtime,
-	}, nil
+		startedAt:      time.Now(),
+		ready:          make(chan struct{}),
+	}
+
+	// Wait for the BEAM's ready signal asynchronously. Callers use fp.Ready()
+	// to wait with their own timeout
+	go func() {
+		type readyResult struct {
+			status byte
+			err    error
+		}
+		readyCh := make(chan readyResult, 1)
+		go func() {
+			var status byte
+			if err := binary.Read(stdout, binary.BigEndian, &status); err != nil {
+				readyCh <- readyResult{err: err}
+				return
+			}
+			var readyLen uint32
+			if err := binary.Read(stdout, binary.BigEndian, &readyLen); err != nil {
+				readyCh <- readyResult{err: err}
+				return
+			}
+			readyCh <- readyResult{status: status}
+		}()
+
+		select {
+		case r := <-readyCh:
+			if r.err != nil {
+				fp.startErr = fmt.Errorf("formatter ready: %w", r.err)
+				_ = cmd.Process.Kill()
+			} else if r.status != 0 {
+				fp.startErr = fmt.Errorf("formatter failed to initialize (status %d)", r.status)
+				_ = cmd.Process.Kill()
+			} else {
+				log.Printf("Formatter: started persistent process for %s (pid %d)", formatterExs, cmd.Process.Pid)
+			}
+		case <-time.After(formatterStuckTimeout):
+			fp.startErr = fmt.Errorf("formatter startup timed out")
+			_ = cmd.Process.Kill()
+		}
+		close(fp.ready)
+	}()
+
+	return fp, nil
 }
 
+// getFormatter returns a cached formatter process (which may still be starting
+// up). If none exists, it launches one and caches it immediately. The mutex is
+// only held briefly — the slow BEAM startup happens asynchronously. Callers
+// must call fp.Ready() before fp.Format() to wait for the process to be usable.
 func (s *Server) getFormatter(mixRoot, formatterExs string) (*formatterProcess, error) {
 	s.formattersMu.Lock()
 	defer s.formattersMu.Unlock()
@@ -234,43 +293,90 @@ func findFormatterConfig(filePath, mixRoot string) string {
 }
 
 // formatContent tries the persistent formatter, falling back to mix format.
-func (s *Server) formatContent(mixRoot, path, content string) (string, error) {
+//
+// Startup-age policy:
+//   - <5s old: wait for the process to become ready, then use it
+//   - 5s–30s old: don't wait, fall back to mix format immediately
+//   - >30s old and still not ready: kill and restart the stuck process
+func (s *Server) formatContent(ctx context.Context, mixRoot, path, content string) (string, error) {
 	formatterExs := findFormatterConfig(path, mixRoot)
 	fp, err := s.getFormatter(mixRoot, formatterExs)
 	if err != nil {
 		log.Printf("Formatting: persistent formatter unavailable, falling back to mix format: %v", err)
-		return s.formatWithMixFormat(mixRoot, path, content)
+		return s.formatWithMixFormat(ctx, mixRoot, path, content)
+	}
+
+	// Check if already ready (non-blocking)
+	select {
+	case <-fp.ready:
+		if fp.startErr != nil {
+			s.evictFormatter(formatterExs, fp)
+			log.Printf("Formatting: persistent formatter failed to start, falling back to mix format: %v", fp.startErr)
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+		}
+	default:
+		// Not ready yet — decide based on how long it's been starting
+		age := time.Since(fp.startedAt)
+		switch {
+		case age > formatterStuckTimeout:
+			// Stuck — kill and restart so the next request gets a fresh process
+			log.Printf("Formatting: persistent formatter stuck (started %s ago), restarting", age.Truncate(time.Second))
+			s.evictFormatter(formatterExs, fp)
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+
+		case age > formatterWaitTimeout:
+			// Taking too long — fall back without waiting
+			log.Printf("Formatting: persistent formatter not ready after %s, falling back to mix format", age.Truncate(time.Millisecond))
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+
+		default:
+			// Recently started — wait for it
+			readyErr := fp.Ready(ctx)
+			if readyErr != nil {
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
+				s.evictFormatter(formatterExs, fp)
+				log.Printf("Formatting: persistent formatter failed to start, falling back to mix format: %v", readyErr)
+				return s.formatWithMixFormat(ctx, mixRoot, path, content)
+			}
+		}
 	}
 
 	start := time.Now()
-	result, err := fp.Format(content, path)
+	result, err := fp.Format(ctx, content, path)
 	if err != nil {
 		var formatErr *FormatError
 		if errors.As(err, &formatErr) {
-			// Source code error (e.g. syntax error) — process is still alive
 			log.Printf("Formatting: %s failed: %s", path, formatErr.Message)
 			return "", err
 		}
-		// Process likely died — evict and fall back
-		s.formattersMu.Lock()
-		delete(s.formatters, formatterExs)
-		s.formattersMu.Unlock()
-		fp.Close()
+		s.evictFormatter(formatterExs, fp)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		log.Printf("Formatting: persistent formatter failed, falling back to mix format: %v", err)
-		return s.formatWithMixFormat(mixRoot, path, content)
+		return s.formatWithMixFormat(ctx, mixRoot, path, content)
 	}
 
 	log.Printf("Formatting: %s (%s, persistent)", path, time.Since(start))
 	return result, nil
 }
 
-func (s *Server) formatWithMixFormat(mixRoot, path, content string) (string, error) {
+func (s *Server) evictFormatter(formatterExs string, fp *formatterProcess) {
+	s.formattersMu.Lock()
+	if s.formatters[formatterExs] == fp {
+		delete(s.formatters, formatterExs)
+	}
+	s.formattersMu.Unlock()
+	fp.Close()
+}
+
+func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, path, content string) (string, error) {
 	if s.mixBin == "" {
 		return "", fmt.Errorf("mix binary not found")
 	}
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	cmd := s.mixCommand(ctx, mixRoot, "format", "--stdin-filename", path, "-")
 	cmd.Stdin = strings.NewReader(content)
 	var stdout, stderr bytes.Buffer
@@ -390,6 +496,50 @@ func (s *Server) clearFormatDiagnostics(uri protocol.DocumentURI) {
 		URI:         uri,
 		Diagnostics: []protocol.Diagnostic{},
 	})
+}
+
+// computeMinimalEdits returns a minimal set of TextEdits to transform original
+// into formatted. Instead of replacing the whole document (which causes the
+// cursor to jump to the end of the file), this trims the common prefix and
+// suffix lines and returns a single edit covering only the changed region.
+func computeMinimalEdits(original, formatted string) []protocol.TextEdit {
+	if original == formatted {
+		return nil
+	}
+
+	oldLines := strings.SplitAfter(original, "\n")
+	newLines := strings.SplitAfter(formatted, "\n")
+
+	// Common prefix lines
+	prefixLen := 0
+	for prefixLen < len(oldLines) && prefixLen < len(newLines) && oldLines[prefixLen] == newLines[prefixLen] {
+		prefixLen++
+	}
+
+	// Common suffix lines (not overlapping with prefix)
+	suffixLen := 0
+	for suffixLen < len(oldLines)-prefixLen && suffixLen < len(newLines)-prefixLen &&
+		oldLines[len(oldLines)-1-suffixLen] == newLines[len(newLines)-1-suffixLen] {
+		suffixLen++
+	}
+
+	startLine := prefixLen
+	endLine := len(oldLines) - suffixLen
+
+	var newText strings.Builder
+	for i := prefixLen; i < len(newLines)-suffixLen; i++ {
+		newText.WriteString(newLines[i])
+	}
+
+	return []protocol.TextEdit{
+		{
+			Range: protocol.Range{
+				Start: protocol.Position{Line: uint32(startLine), Character: 0},
+				End:   protocol.Position{Line: uint32(endLine), Character: 0},
+			},
+			NewText: newText.String(),
+		},
+	}
 }
 
 func (s *Server) closeFormatters() {

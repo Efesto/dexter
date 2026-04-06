@@ -2485,7 +2485,10 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 		return nil, nil
 	}
 
-	formatted, err := s.formatContent(mixRoot, path, text)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	formatted, err := s.formatContent(ctx, mixRoot, path, text)
 	if err != nil {
 		var formatErr *FormatError
 		if errors.As(err, &formatErr) {
@@ -2496,20 +2499,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 
 	s.clearFormatDiagnostics(params.TextDocument.URI)
 
-	if formatted == text {
-		return nil, nil
-	}
-
-	lines := strings.Count(text, "\n") + 1
-	return []protocol.TextEdit{
-		{
-			Range: protocol.Range{
-				Start: protocol.Position{Line: 0, Character: 0},
-				End:   protocol.Position{Line: uint32(lines), Character: 0},
-			},
-			NewText: formatted,
-		},
-	}, nil
+	return computeMinimalEdits(text, formatted), nil
 }
 func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {
 	docURI := string(params.TextDocument.URI)

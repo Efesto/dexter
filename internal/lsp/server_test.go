@@ -2310,11 +2310,16 @@ end
 	if len(edits) != 1 {
 		t.Fatalf("expected 1 edit, got %d", len(edits))
 	}
-	if edits[0].Range.Start.Line != 0 || edits[0].Range.Start.Character != 0 {
-		t.Error("expected edit to start at 0:0")
+	// Minimal edit should NOT start at line 0 — the "end\n" suffix is shared
+	if edits[0].Range.Start.Character != 0 {
+		t.Error("expected edit to start at character 0")
 	}
 	if !strings.Contains(edits[0].NewText, "defmodule MyApp.Fmt do") {
 		t.Errorf("expected formatted output, got: %s", edits[0].NewText)
+	}
+	// The edit range should be smaller than the whole document
+	if edits[0].Range.End.Line > 3 {
+		t.Errorf("expected minimal edit range, but end line is %d", edits[0].Range.End.Line)
 	}
 }
 

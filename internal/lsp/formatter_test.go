@@ -215,3 +215,90 @@ func TestFormatterServer_DifferentProjectsDifferentResults(t *testing.T) {
 		t.Errorf("expected basic project to keep pipe, got:\n%s", basicResult)
 	}
 }
+
+func TestComputeMinimalEdits(t *testing.T) {
+	t.Run("identical text returns nil", func(t *testing.T) {
+		edits := computeMinimalEdits("hello\nworld\n", "hello\nworld\n")
+		if edits != nil {
+			t.Errorf("expected nil, got %v", edits)
+		}
+	})
+
+	t.Run("single line change in middle", func(t *testing.T) {
+		original := "line1\nline2\nline3\n"
+		formatted := "line1\nline2_changed\nline3\n"
+		edits := computeMinimalEdits(original, formatted)
+		if len(edits) != 1 {
+			t.Fatalf("expected 1 edit, got %d", len(edits))
+		}
+		// Should only cover line 1 (0-indexed), not the whole document
+		if edits[0].Range.Start.Line != 1 {
+			t.Errorf("expected start line 1, got %d", edits[0].Range.Start.Line)
+		}
+		if edits[0].Range.End.Line != 2 {
+			t.Errorf("expected end line 2, got %d", edits[0].Range.End.Line)
+		}
+		if edits[0].NewText != "line2_changed\n" {
+			t.Errorf("unexpected new text: %q", edits[0].NewText)
+		}
+	})
+
+	t.Run("change at beginning preserves suffix", func(t *testing.T) {
+		original := "  bad_indent\nline2\nline3\n"
+		formatted := "good_indent\nline2\nline3\n"
+		edits := computeMinimalEdits(original, formatted)
+		if len(edits) != 1 {
+			t.Fatalf("expected 1 edit, got %d", len(edits))
+		}
+		if edits[0].Range.Start.Line != 0 {
+			t.Errorf("expected start line 0, got %d", edits[0].Range.Start.Line)
+		}
+		if edits[0].Range.End.Line != 1 {
+			t.Errorf("expected end line 1, got %d", edits[0].Range.End.Line)
+		}
+	})
+
+	t.Run("line insertion", func(t *testing.T) {
+		original := "line1\nline3\n"
+		formatted := "line1\nline2\nline3\n"
+		edits := computeMinimalEdits(original, formatted)
+		if len(edits) != 1 {
+			t.Fatalf("expected 1 edit, got %d", len(edits))
+		}
+		// Insert at line 1 with zero-width old range
+		if edits[0].Range.Start.Line != 1 || edits[0].Range.End.Line != 1 {
+			t.Errorf("expected insert at line 1, got %d-%d", edits[0].Range.Start.Line, edits[0].Range.End.Line)
+		}
+		if edits[0].NewText != "line2\n" {
+			t.Errorf("unexpected new text: %q", edits[0].NewText)
+		}
+	})
+
+	t.Run("line deletion", func(t *testing.T) {
+		original := "line1\nline2\nline3\n"
+		formatted := "line1\nline3\n"
+		edits := computeMinimalEdits(original, formatted)
+		if len(edits) != 1 {
+			t.Fatalf("expected 1 edit, got %d", len(edits))
+		}
+		if edits[0].Range.Start.Line != 1 || edits[0].Range.End.Line != 2 {
+			t.Errorf("expected delete line 1-2, got %d-%d", edits[0].Range.Start.Line, edits[0].Range.End.Line)
+		}
+		if edits[0].NewText != "" {
+			t.Errorf("expected empty new text, got: %q", edits[0].NewText)
+		}
+	})
+
+	t.Run("full document change still works", func(t *testing.T) {
+		original := "aaa\nbbb\n"
+		formatted := "xxx\nyyy\n"
+		edits := computeMinimalEdits(original, formatted)
+		if len(edits) != 1 {
+			t.Fatalf("expected 1 edit, got %d", len(edits))
+		}
+		// No common prefix or suffix, but the trailing "" from SplitAfter matches
+		if edits[0].NewText != "xxx\nyyy\n" {
+			t.Errorf("unexpected new text: %q", edits[0].NewText)
+		}
+	})
+}

@@ -12,7 +12,7 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
-	"github.com/remoteoss/dexterdexter/internal/store"
+	"github.com/remoteoss/dexter/internal/store"
 )
 
 func fixtureMonorepoPath(t *testing.T) string {

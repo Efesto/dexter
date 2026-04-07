@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/remoteoss/dexterdexter/internal/parser"
+	"github.com/remoteoss/dexter/internal/parser"
 )
 
 func setupTestStore(t *testing.T) (*Store, string) {

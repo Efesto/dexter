@@ -1,4 +1,4 @@
-module github.com/remoteoss/dexterdexter
+module github.com/remoteoss/dexter
 
 go 1.26.1
 

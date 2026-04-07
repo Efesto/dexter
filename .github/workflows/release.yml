@@ -24,15 +24,19 @@ jobs:
           - runner: ubuntu-latest
             goos: linux
             goarch: amd64
+            platform: Linux_x86_64
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
+            platform: Linux_arm64
           - runner: macos-latest
             goos: darwin
             goarch: arm64
+            platform: Darwin_arm64
           - runner: macos-13
             goos: darwin
             goarch: amd64
+            platform: Darwin_x86_64
     runs-on: ${{ matrix.runner }}
     env:
       CGO_ENABLED: "1"
@@ -49,10 +53,7 @@ jobs:
             go build -o dexter ./cmd/
       - name: Package
         run: |
-          arch=${{ matrix.goarch }}
-          if [ "$arch" = "amd64" ]; then arch="x86_64"; fi
-          os=$(echo "${{ matrix.goos }}" | sed 's/./\U&/')
-          name="dexter_${os}_${arch}"
+          name="dexter_${{ matrix.platform }}"
           mkdir "$name"
           cp dexter "$name/"
           tar czf "${name}.tar.gz" "$name"

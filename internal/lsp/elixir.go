@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/remoteoss/dexterdexter/internal/parser"
+	"github.com/remoteoss/dexter/internal/parser"
 )
 
 func isExprChar(b byte) bool {

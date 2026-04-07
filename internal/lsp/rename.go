@@ -7,7 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/remoteoss/dexterdexter/internal/parser"
+	"github.com/remoteoss/dexter/internal/parser"
 )
 
 // findTokenColumn returns the start column (0-based) of the first whole-token

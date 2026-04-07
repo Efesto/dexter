@@ -13,9 +13,9 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
-	"github.com/remoteoss/dexterdexter/internal/parser"
-	"github.com/remoteoss/dexterdexter/internal/stdlib"
-	"github.com/remoteoss/dexterdexter/internal/store"
+	"github.com/remoteoss/dexter/internal/parser"
+	"github.com/remoteoss/dexter/internal/stdlib"
+	"github.com/remoteoss/dexter/internal/store"
 )
 
 func setupTestServer(t *testing.T) (*Server, func()) {

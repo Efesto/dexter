@@ -11,11 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	dexter_lsp "github.com/remoteoss/dexterdexter/internal/lsp"
-	"github.com/remoteoss/dexterdexter/internal/parser"
-	"github.com/remoteoss/dexterdexter/internal/stdlib"
-	"github.com/remoteoss/dexterdexter/internal/store"
-	"github.com/remoteoss/dexterdexter/internal/version"
+	dexter_lsp "github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/parser"
+	"github.com/remoteoss/dexter/internal/stdlib"
+	"github.com/remoteoss/dexter/internal/store"
+	"github.com/remoteoss/dexter/internal/version"
 	"github.com/spf13/cobra"
 )
 

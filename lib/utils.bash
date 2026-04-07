@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-GH_REPO=git@github.com:remoteoss/dexterdexter
+GH_REPO=git@github.com:remoteoss/dexter
 TOOL_NAME="dexter"
 TOOL_TEST="dexter --help"
 

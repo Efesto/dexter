@@ -43,7 +43,7 @@ brew install sqlite
 mise use -g go@1.26.1
 
 # 2. Install dexter (requires a tagged release to exist)
-mise plugin add dexter git@github.com:remoteoss/dexterdexter.git && mise use -g dexter@latest
+mise plugin add dexter git@github.com:remoteoss/dexter.git && mise use -g dexter@latest
 
 # 3. Add .dexter.db to your global .gitignore
 echo ".dexter.db*" >> .gitignore
@@ -58,7 +58,7 @@ echo ".dexter.db*" >> .gitignore
 ### VS Code / Cursor extension
 
 ```sh
-git clone git@github.com:remoteoss/dexterdexter-vscode.git
+git clone git@github.com:remoteoss/dexter-vscode.git
 cd dexter-vscode
 make install   # or `make install-vscode` for VS Code
 ```
@@ -113,9 +113,9 @@ lspconfig.dexter.setup({})
 
 ### Zed
 
-Install the [dexter-zed](https://github.com/remoteoss/dexterdexter-zed) extension:
+Install the [dexter-zed](https://github.com/remoteoss/dexter-zed) extension:
 
-1. Clone the extension: `git clone git@github.com:remoteoss/dexterdexter-zed.git`
+1. Clone the extension: `git clone git@github.com:remoteoss/dexter-zed.git`
 2. In Zed, open the command palette (`Cmd+Shift+P`) and run **"zed: install dev extension"**
 3. Select the `dexter-zed/` directory
 
@@ -136,10 +136,10 @@ Configure the binary path in Zed's `settings.json`:
 
 ### Cursor/VSCode
 
-Install the [dexter-vscode](https://github.com/remoteoss/dexterdexter-vscode) extension, then optionally set the binary path if dexter is not on your PATH:
+Install the [dexter-vscode](https://github.com/remoteoss/dexter-vscode) extension, then optionally set the binary path if dexter is not on your PATH:
 
 ```sh
-git clone git@github.com:remoteoss/dexterdexter-vscode.git
+git clone git@github.com:remoteoss/dexter-vscode.git
 cd dexter-vscode
 make install   # for Cursor, or make install-vscode for VSCode
 ```
@@ -372,7 +372,7 @@ Other Elixir LSPs compile your project to build their understanding of the code.
 Requires Go 1.21+, SQLite, and Elixir.
 
 ```sh
-git clone git@github.com:remoteoss/dexterdexter.git
+git clone git@github.com:remoteoss/dexter.git
 cd dexter
 mise install
 make build

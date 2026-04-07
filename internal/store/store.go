@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
+	"github.com/remoteoss/dexterdexter/internal/parser"
 )
 
 type Store struct {

@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-GL_REPO=git@gitlab.com:remote-com/employ-starbase/dexter
+GL_REPO=git@github.com:remoteoss/dexterdexter
 TOOL_NAME="dexter"
 TOOL_TEST="dexter --help"
 

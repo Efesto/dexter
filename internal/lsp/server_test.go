@@ -13,9 +13,9 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/stdlib"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
+	"github.com/remoteoss/dexterdexter/internal/parser"
+	"github.com/remoteoss/dexterdexter/internal/stdlib"
+	"github.com/remoteoss/dexterdexter/internal/store"
 )
 
 func setupTestServer(t *testing.T) (*Server, func()) {

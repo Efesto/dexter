@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	dexter_lsp "gitlab.com/remote-com/employ-starbase/dexter/internal/lsp"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/stdlib"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
+	dexter_lsp "github.com/remoteoss/dexterdexter/internal/lsp"
+	"github.com/remoteoss/dexterdexter/internal/parser"
+	"github.com/remoteoss/dexterdexter/internal/stdlib"
+	"github.com/remoteoss/dexterdexter/internal/store"
+	"github.com/remoteoss/dexterdexter/internal/version"
 )
 
 func main() {

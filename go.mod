@@ -1,4 +1,4 @@
-module gitlab.com/remote-com/employ-starbase/dexter
+module github.com/remoteoss/dexterdexter
 
 go 1.26.1
 

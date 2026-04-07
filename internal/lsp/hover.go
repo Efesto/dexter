@@ -5,8 +5,8 @@ import (
 
 	"go.lsp.dev/protocol"
 
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
+	"github.com/remoteoss/dexterdexter/internal/parser"
+	"github.com/remoteoss/dexterdexter/internal/store"
 )
 
 func (s *Server) hoverFromFile(function string, result store.LookupResult) (*protocol.Hover, error) {

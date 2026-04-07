@@ -22,11 +22,11 @@ import (
 	"go.lsp.dev/uri"
 	"go.uber.org/zap"
 
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/stdlib"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/treesitter"
-	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
+	"github.com/remoteoss/dexterdexter/internal/parser"
+	"github.com/remoteoss/dexterdexter/internal/stdlib"
+	"github.com/remoteoss/dexterdexter/internal/store"
+	"github.com/remoteoss/dexterdexter/internal/treesitter"
+	"github.com/remoteoss/dexterdexter/internal/version"
 )
 
 // optBinding represents a dynamic import/use in __using__ driven by opts.

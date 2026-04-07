@@ -212,7 +212,7 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 		fatal(err)
 	}
 	var stdlibRoot string
-	if root, ok := stdlib.Resolve(s, ""); ok {
+	if root, ok := stdlib.Resolve(s, "", projectRoot); ok {
 		stdlibRoot = root
 		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, d fs.DirEntry) error {
 			info, err := d.Info()

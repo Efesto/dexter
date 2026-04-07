@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -55,6 +56,7 @@ type Definition struct {
 	Kind       string
 	DelegateTo string
 	DelegateAs string // for defdelegate with as: — the function name in the target module
+	Params     string // comma-separated parameter names for this arity
 }
 
 type Reference struct {
@@ -391,7 +393,10 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 						delegateTo, delegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
 					}
 
+					allParamNames := ExtractParamNames(line, funcName)
+
 					for arity := minArity; arity <= maxArity; arity++ {
+						params := JoinParams(allParamNames, arity)
 						defs = append(defs, Definition{
 							Module:     currentModule,
 							Function:   funcName,
@@ -401,6 +406,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 							Kind:       kind,
 							DelegateTo: delegateTo,
 							DelegateAs: delegateAs,
+							Params:     params,
 						})
 					}
 					// Don't continue — line may contain refs like: def foo, do: Repo.all()
@@ -788,8 +794,109 @@ func CountDefaultParams(line string, funcName string) int {
 	return defaults
 }
 
+// ExtractParamNames extracts readable parameter names from a function
+// definition line. Returns nil if the line can't be parsed. For complex
+// patterns (e.g. %{name: name}), falls back to positional names like "arg1".
+func ExtractParamNames(line, funcName string) []string {
+	idx := strings.Index(line, funcName)
+	if idx < 0 {
+		return nil
+	}
+	rest := line[idx+len(funcName):]
+	parenIdx := strings.IndexByte(rest, '(')
+	if parenIdx < 0 {
+		return nil
+	}
+
+	inside := rest[parenIdx+1:]
+	depth := 1
+	var end int
+	for i := 0; i < len(inside); i++ {
+		switch inside[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				end = i
+				goto found
+			}
+		}
+	}
+	return nil
+
+found:
+	paramStr := inside[:end]
+	if strings.TrimSpace(paramStr) == "" {
+		return nil
+	}
+
+	var params []string
+	depth = 0
+	start := 0
+	for i := 0; i < len(paramStr); i++ {
+		switch paramStr[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case '<':
+			if i+1 < len(paramStr) && paramStr[i+1] == '<' {
+				depth++
+				i++
+			}
+		case '>':
+			if i+1 < len(paramStr) && paramStr[i+1] == '>' {
+				depth--
+				i++
+			}
+		case ',':
+			if depth == 0 {
+				params = append(params, strings.TrimSpace(paramStr[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	params = append(params, strings.TrimSpace(paramStr[start:]))
+
+	var names []string
+	for i, p := range params {
+		if bsIdx := strings.Index(p, "\\\\"); bsIdx >= 0 {
+			p = strings.TrimSpace(p[:bsIdx])
+		}
+		name := scanParamName(p, i)
+		names = append(names, name)
+	}
+	return names
+}
+
+// JoinParams returns a comma-separated string of the first `arity` parameter
+// names extracted from a function definition. Returns "" when names is nil or
+// shorter than arity.
+func JoinParams(names []string, arity int) string {
+	if names == nil || arity > len(names) {
+		return ""
+	}
+	return strings.Join(names[:arity], ",")
+}
+
+func scanParamName(param string, index int) string {
+	param = strings.TrimSpace(param)
+	if name := ScanFuncName(param); name != "" && name != "_" {
+		return name
+	}
+	// Handle "pattern = variable" (e.g. %User{} = user, [_ | _] = list)
+	if eqIdx := strings.LastIndex(param, "="); eqIdx >= 0 {
+		after := strings.TrimSpace(param[eqIdx+1:])
+		if name := ScanFuncName(after); name != "" && name != "_" {
+			return name
+		}
+	}
+	return "arg" + strconv.Itoa(index+1)
+}
+
 // skipStringLiteral advances past a string or charlist literal starting at
-// position i in s (where s[i] is '"' or '\”). Returns the index of the
+// position i in s (where s[i] is '"' or '\"). Returns the index of the
 // closing quote character so that the outer for-loop's i++ lands past it.
 func skipStringLiteral(s string, i int) int {
 	quote := s[i]

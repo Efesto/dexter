@@ -148,10 +148,25 @@ func ExtractCompletionContext(line string, col int) (prefix string, afterDot boo
 	return raw, false, start
 }
 
+// IsPipeContext returns true if the text before prefixStartCol on this line
+// contains a pipe operator (|>), meaning the first argument is supplied by the
+// pipe and should be omitted from the completion snippet.
+//
+// Theoretically, this could cause false positives for pipes within strings. If
+// this becomes an annoying problem (I don't think it will) then we can fix.
+func IsPipeContext(line string, prefixStartCol int) bool {
+	before := line
+	if prefixStartCol < len(line) {
+		before = line[:prefixStartCol]
+	}
+	return strings.Contains(strings.TrimSpace(before), "|>")
+}
+
 type BufferFunction struct {
-	Name  string
-	Arity int
-	Kind  string
+	Name   string
+	Arity  int
+	Kind   string
+	Params string
 }
 
 // FindBufferFunctions scans document text for all function and type definitions.
@@ -166,11 +181,12 @@ func FindBufferFunctions(text string) []BufferFunction {
 			name := m[2]
 			maxArity := parser.ExtractArity(line, name)
 			minArity := maxArity - parser.CountDefaultParams(line, name)
+			allParamNames := parser.ExtractParamNames(line, name)
 			for arity := minArity; arity <= maxArity; arity++ {
 				key := name + "/" + strconv.Itoa(arity)
 				if !seen[key] {
 					seen[key] = true
-					results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1]})
+					results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1], Params: parser.JoinParams(allParamNames, arity)})
 				}
 			}
 		} else if m := parser.TypeDefRe.FindStringSubmatch(line); m != nil {
@@ -426,10 +442,12 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		}
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
 			funcName := m[2]
+			arity := parser.ExtractArity(line, funcName)
 			inlineDefs[funcName] = append(inlineDefs[funcName], inlineDef{
-				line:  i + 1,
-				arity: parser.ExtractArity(line, funcName),
-				kind:  m[1],
+				line:   i + 1,
+				arity:  arity,
+				kind:   m[1],
+				params: parser.JoinParams(parser.ExtractParamNames(line, funcName), arity),
 			})
 		}
 	}
@@ -488,9 +506,10 @@ func ParseKeywordModuleOpts(optsStr string, aliases map[string]string) map[strin
 // quote do block. These definitions get injected into any module that `use`s
 // the parent module.
 type inlineDef struct {
-	line  int // 1-based line number in the source file
-	arity int
-	kind  string // "def", "defp", "defmacro", etc.
+	line   int // 1-based line number in the source file
+	arity  int
+	kind   string // "def", "defp", "defmacro", etc.
+	params string // comma-separated parameter names
 }
 
 // parseUsingBody finds the defmacro __using__ block in text and scans its body
@@ -648,10 +667,12 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
 			funcName := m[2]
+			arity := parser.ExtractArity(line, funcName)
 			inlineDefs[funcName] = append(inlineDefs[funcName], inlineDef{
-				line:  i + 1,
-				arity: parser.ExtractArity(line, funcName),
-				kind:  m[1],
+				line:   i + 1,
+				arity:  arity,
+				kind:   m[1],
+				params: parser.JoinParams(parser.ExtractParamNames(line, funcName), arity),
 			})
 		}
 	}
@@ -893,86 +914,9 @@ func extractParamNames(lines []string, defIdx int) []string {
 		return nil
 	}
 	line := lines[defIdx]
-
-	// Find the function name via FuncDefRe, then locate its param list
 	m := parser.FuncDefRe.FindStringSubmatch(line)
 	if m == nil {
 		return nil
 	}
-	funcName := m[2]
-
-	idx := strings.Index(line, funcName)
-	if idx < 0 {
-		return nil
-	}
-	rest := line[idx+len(funcName):]
-	parenIdx := strings.IndexByte(rest, '(')
-	if parenIdx < 0 {
-		return nil
-	}
-
-	// Extract the content inside the outermost parens
-	inside := rest[parenIdx+1:]
-	depth := 1
-	end := 0
-	for i := 0; i < len(inside); i++ {
-		switch inside[i] {
-		case '(', '[', '{':
-			depth++
-		case ')', ']', '}':
-			depth--
-			if depth == 0 {
-				end = i
-				goto found
-			}
-		}
-	}
-	return nil
-
-found:
-	paramStr := inside[:end]
-	if strings.TrimSpace(paramStr) == "" {
-		return nil
-	}
-
-	// Split by commas at depth 0
-	var params []string
-	depth = 0
-	start := 0
-	for i := 0; i < len(paramStr); i++ {
-		switch paramStr[i] {
-		case '(', '[', '{':
-			depth++
-		case ')', ']', '}':
-			depth--
-		case ',':
-			if depth == 0 {
-				params = append(params, strings.TrimSpace(paramStr[start:i]))
-				start = i + 1
-			}
-		}
-	}
-	params = append(params, strings.TrimSpace(paramStr[start:]))
-
-	// Extract a readable name from each param
-	var names []string
-	for i, p := range params {
-		// Strip default value (\\)
-		if bsIdx := strings.Index(p, "\\\\"); bsIdx >= 0 {
-			p = strings.TrimSpace(p[:bsIdx])
-		}
-		name := extractParamName(p, i)
-		names = append(names, name)
-	}
-	return names
-}
-
-// extractParamName tries to pull a clean variable name from a single parameter.
-// Returns a positional fallback for complex patterns.
-func extractParamName(param string, index int) string {
-	param = strings.TrimSpace(param)
-	if name := parser.ScanFuncName(param); name != "" && name != "_" {
-		return name
-	}
-	return "arg" + strconv.Itoa(index+1)
+	return parser.ExtractParamNames(line, m[2])
 }

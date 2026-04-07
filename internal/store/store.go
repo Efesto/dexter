@@ -71,6 +71,7 @@ func migrate(db *sql.DB) error {
 			file_path TEXT NOT NULL,
 			delegate_to TEXT NOT NULL DEFAULT '',
 			delegate_as TEXT NOT NULL DEFAULT '',
+			params TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
 		);
 
@@ -207,14 +208,14 @@ func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []
 		return err
 	}
 
-	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = defStmt.Close() }()
 
 	for _, d := range defs {
-		if _, err := defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs); err != nil {
+		if _, err := defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
 			return err
 		}
 	}
@@ -265,7 +266,7 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 		return nil, err
 	}
 
-	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, err
@@ -343,7 +344,7 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 	}
 
 	for _, d := range defs {
-		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs); err != nil {
+		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
 			return err
 		}
 	}
@@ -432,6 +433,7 @@ type CompletionResult struct {
 	Kind     string
 	FilePath string
 	Line     int
+	Params   string
 }
 
 // SearchModulesBySuffix returns modules whose name ends with the given suffix.
@@ -522,7 +524,7 @@ func (s *Store) SearchSubmoduleSegments(parentModule string, segmentPrefix strin
 }
 
 func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]CompletionResult, error) {
-	query := "SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module = ? AND function != '' AND kind NOT IN ('callback', 'macrocallback')"
+	query := "SELECT module, function, arity, kind, file_path, line, params FROM definitions WHERE module = ? AND function != '' AND kind NOT IN ('callback', 'macrocallback')"
 	if publicOnly {
 		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque')"
 	}
@@ -537,7 +539,7 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 	var results []CompletionResult
 	for rows.Next() {
 		var r CompletionResult
-		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line); err != nil {
+		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line, &r.Params); err != nil {
 			return nil, err
 		}
 		results = append(results, r)

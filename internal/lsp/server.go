@@ -73,8 +73,10 @@ type Server struct {
 
 	conn                  jsonrpc2.Conn // raw connection for server-initiated requests not on the Client interface
 	showDocumentSupported bool          // client supports window/showDocument (LSP 3.16+)
+	snippetSupport        bool          // client supports snippet insert text in completions
 
-	reindexing sync.Mutex // serializes concurrent backgroundReindex calls
+	reindexing          sync.Mutex // serializes concurrent backgroundReindex calls
+	notifiedOTPMismatch sync.Once  // prevents repeated OTP mismatch warnings
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -261,6 +263,21 @@ func (s *Server) periodicReindex() {
 	}()
 }
 
+// notifyOTPMismatch checks stderr output for an OTP version mismatch and
+// sends a one-time warning to the editor so the user doesn't have to dig
+// through logs.
+func (s *Server) notifyOTPMismatch(stderr string) {
+	if s.client == nil || !strings.Contains(stderr, "requires a more recent Erlang/OTP") {
+		return
+	}
+	s.notifiedOTPMismatch.Do(func() {
+		_ = s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+			Type:    protocol.MessageTypeError,
+			Message: "Dexter: Elixir/OTP version mismatch - your Elixir install for this project was compiled for a newer OTP version than what is running. Update your Erlang to match, or switch to an Elixir build that targets your current OTP (e.g. elixir@...-otp-27).",
+		})
+	})
+}
+
 // === LSP Lifecycle ===
 
 func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
@@ -296,7 +313,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 
 	log.Printf("Initialize: projectRoot=%s debug=%v", s.projectRoot, s.debug)
 
-	if root, ok := stdlib.Resolve(s.store, explicitStdlibPath); ok {
+	if root, ok := stdlib.Resolve(s.store, explicitStdlibPath, s.projectRoot); ok {
 		s.stdlibRoot = root
 		log.Printf("Elixir stdlib at: %s", root)
 
@@ -314,7 +331,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		if s.client != nil {
 			_ = s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
 				Type:    protocol.MessageTypeWarning,
-				Message: "Dexter: could not detect Elixir stdlib — stdlib modules (Enum, String, etc.) won't resolve. Set stdlibPath in initializationOptions or DEXTER_ELIXIR_LIB_ROOT.",
+				Message: "Dexter: could not detect Elixir stdlib - stdlib modules (Enum, String, etc.) won't resolve. Verify the Elixir version in your .tool-versions or mise.toml is installed (e.g. `mise install`), or set DEXTER_ELIXIR_LIB_ROOT.",
 			})
 		}
 	}
@@ -338,6 +355,10 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
 		s.showDocumentSupported = params.Capabilities.Window.ShowDocument.Support
+	}
+	if params.Capabilities.TextDocument != nil && params.Capabilities.TextDocument.Completion != nil &&
+		params.Capabilities.TextDocument.Completion.CompletionItem != nil {
+		s.snippetSupport = params.Capabilities.TextDocument.Completion.CompletionItem.SnippetSupport
 	}
 
 	result := &protocol.InitializeResult{
@@ -947,6 +968,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	}
 
 	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
+	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
 
 	var items []protocol.CompletionItem
 
@@ -970,7 +992,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					"line":     r.Line,
 				},
 			}
-			applySnippet(&item, r.Function, r.Arity)
+			applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, s.snippetSupport)
 			items = append(items, item)
 		}
 
@@ -1057,7 +1079,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					Kind:   kindToCompletionItemKind(bf.Kind),
 					Detail: bf.Kind,
 				}
-				applySnippet(&item, bf.Name, bf.Arity)
+				applySnippet(&item, bf.Name, bf.Arity, bf.Params, inPipe, s.snippetSupport)
 				items = append(items, item)
 			}
 		}
@@ -1080,7 +1102,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 							"line":     r.Line,
 						},
 					}
-					applySnippet(&item, r.Function, r.Arity)
+					applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, s.snippetSupport)
 					items = append(items, item)
 				}
 			}
@@ -1090,7 +1112,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		aliases := ExtractAliases(text)
 		visitedCompletion := make(map[string]bool)
 		for _, usedModule := range ExtractUses(text) {
-			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion)
+			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion, inPipe, s.snippetSupport)
 		}
 
 		// Variables in scope via tree-sitter
@@ -1444,7 +1466,7 @@ func (s *Server) findModulesWhoseUsingImports(targetModule string) []string {
 
 // addCompletionsFromUsing adds completion items injected by a module's __using__
 // body — inline defs, imported functions, and transitive uses — into items.
-func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool) {
+func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool, inPipe bool, useSnippets bool) {
 	if visited[moduleName] {
 		return
 	}
@@ -1472,7 +1494,7 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 						"line":     d.line,
 					},
 				}
-				applySnippet(&item, funcName, d.arity)
+				applySnippet(&item, funcName, d.arity, d.params, inPipe, useSnippets)
 				*items = append(*items, item)
 			}
 		}
@@ -1496,14 +1518,14 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 						"line":     r.Line,
 					},
 				}
-				applySnippet(&item, r.Function, r.Arity)
+				applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, useSnippets)
 				*items = append(*items, item)
 			}
 		}
 	}
 
 	for _, transModule := range entry.transUses {
-		s.addCompletionsFromUsing(transModule, funcPrefix, seen, items, visited)
+		s.addCompletionsFromUsing(transModule, funcPrefix, seen, items, visited, inPipe, useSnippets)
 	}
 }
 
@@ -1609,23 +1631,70 @@ func funcKey(name string, arity int) string {
 	return name + "/" + strconv.Itoa(arity)
 }
 
-func applySnippet(item *protocol.CompletionItem, name string, arity int) {
+func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, inPipe bool, useSnippets bool) {
 	item.Label = fmt.Sprintf("%s/%d", name, arity)
 	item.FilterText = name
-	item.InsertTextFormat = protocol.InsertTextFormatSnippet
-	if arity > 0 {
-		item.InsertText = functionSnippet(name, arity)
+
+	snippetArity := arity
+	snippetParams := params
+	if inPipe && arity > 0 {
+		snippetArity--
+		if snippetParams != "" {
+			if commaIdx := strings.IndexByte(snippetParams, ','); commaIdx >= 0 {
+				snippetParams = snippetParams[commaIdx+1:]
+			} else {
+				snippetParams = ""
+			}
+		}
+	}
+
+	if !useSnippets {
+		if snippetArity > 0 {
+			item.InsertText = functionCallText(name, snippetArity, snippetParams)
+		} else {
+			item.InsertText = name + "()"
+		}
+		return
+	}
+
+	if snippetArity > 0 {
+		item.InsertTextFormat = protocol.InsertTextFormatSnippet
+		item.InsertText = functionSnippet(name, snippetArity, snippetParams)
 	} else {
 		item.InsertText = name + "()"
 	}
 }
 
-func functionSnippet(name string, arity int) string {
+func functionSnippet(name string, arity int, params string) string {
+	return buildCallText(name, arity, params, true)
+}
+
+func functionCallText(name string, arity int, params string) string {
+	return buildCallText(name, arity, params, false)
+}
+
+func buildCallText(name string, arity int, params string, snippet bool) string {
+	var paramNames []string
+	if params != "" {
+		paramNames = strings.Split(params, ",")
+	}
 	var args []string
 	for i := 1; i <= arity; i++ {
-		args = append(args, fmt.Sprintf("${%d:arg%d}", i, i))
+		paramName := fmt.Sprintf("arg%d", i)
+		if i-1 < len(paramNames) {
+			paramName = paramNames[i-1]
+		}
+		if snippet {
+			args = append(args, fmt.Sprintf("${%d:%s}", i, paramName))
+		} else {
+			args = append(args, paramName)
+		}
 	}
-	return name + "(" + strings.Join(args, ", ") + ")"
+	call := name + "(" + strings.Join(args, ", ") + ")"
+	if snippet {
+		call += "$0"
+	}
+	return call
 }
 
 func kindToCompletionItemKind(kind string) protocol.CompletionItemKind {

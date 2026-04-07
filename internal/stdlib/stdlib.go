@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -26,10 +25,10 @@ type Cache interface {
 //  1. explicitPath (from LSP initializationOptions.stdlibPath) — used as-is, not cached
 //  2. DEXTER_ELIXIR_LIB_ROOT env var — used as-is, not cached
 //  3. Cached value from the DB — used if the path still exists on disk
-//  4. Detection: mise → asdf → executable path → elixir subprocess → login shell
+//  4. Detection: mise where → asdf where → executable path → elixir subprocess → login shell
 //
 // A freshly detected path is written back to the cache.
-func Resolve(cache Cache, explicitPath string) (string, bool) {
+func Resolve(cache Cache, explicitPath, projectRoot string) (string, bool) {
 	// Explicit overrides bypass the cache entirely — they are the source of truth.
 	if explicitPath != "" {
 		return explicitPath, true
@@ -38,13 +37,22 @@ func Resolve(cache Cache, explicitPath string) (string, bool) {
 		return v, true
 	}
 
-	// Use the cached path if it still exists on disk.
+	// Ask the version manager for the active Elixir install. This is cheap enough
+	// (~20ms) and catches version switches that leave the old path on disk.
+	if root, ok := deriveFromVersionManager(projectRoot); ok {
+		if cached, hasCached := cache.GetStdlibRoot(); !hasCached || cached != root {
+			_ = cache.SetStdlibRoot(root)
+		}
+		return root, true
+	}
+
+	// No version manager available — use the cached path if it still exists.
 	if cached, ok := cache.GetStdlibRoot(); ok && dirHasElixirSources(cached) {
 		return cached, true
 	}
 
-	// Detect and persist the result.
-	root, ok := DetectElixirLibRoot()
+	// Full detection as a last resort (includes subprocess-based strategies).
+	root, ok := DetectElixirLibRoot(projectRoot)
 	if ok {
 		_ = cache.SetStdlibRoot(root)
 	}
@@ -53,10 +61,11 @@ func Resolve(cache Cache, explicitPath string) (string, bool) {
 
 // DetectElixirLibRoot runs the full detection chain with no caching. It tries
 // each strategy in order and returns the first path that contains Elixir sources.
-func DetectElixirLibRoot() (string, bool) {
+// projectRoot is used by mise/asdf to resolve the active version for the project.
+func DetectElixirLibRoot(projectRoot string) (string, bool) {
 	for _, fn := range []func() (string, bool){
-		deriveFromMise,
-		deriveFromAsdf,
+		func() (string, bool) { return deriveFromMise(projectRoot) },
+		func() (string, bool) { return deriveFromAsdf(projectRoot) },
 		deriveFromElixirExecutable,
 		detectViaRuntime,
 		detectViaLoginShell,
@@ -68,57 +77,65 @@ func DetectElixirLibRoot() (string, bool) {
 	return "", false
 }
 
-// deriveFromMise scans the mise installs directory for Elixir versions.
-func deriveFromMise() (string, bool) {
-	dataDir := os.Getenv("MISE_DATA_DIR")
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", false
-		}
-		dataDir = filepath.Join(home, ".local", "share", "mise")
+// deriveFromVersionManager tries mise then asdf. Used by Resolve to validate
+// the cache before falling back to the full detection chain.
+func deriveFromVersionManager(projectRoot string) (string, bool) {
+	if root, ok := deriveFromMise(projectRoot); ok {
+		return root, true
 	}
-	return scanVersionsDir(filepath.Join(dataDir, "installs", "elixir"))
+	return deriveFromAsdf(projectRoot)
 }
 
-// deriveFromAsdf scans the asdf installs directory for Elixir versions.
-func deriveFromAsdf() (string, bool) {
-	dataDir := os.Getenv("ASDF_DATA_DIR")
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", false
-		}
-		dataDir = filepath.Join(home, ".asdf")
+// deriveFromMise asks mise for the active Elixir install path for the project.
+func deriveFromMise(projectRoot string) (string, bool) {
+	if _, err := exec.LookPath("mise"); err != nil {
+		return "", false
 	}
-	return scanVersionsDir(filepath.Join(dataDir, "installs", "elixir"))
-}
-
-// scanVersionsDir looks for the latest valid Elixir install under a
-// version-per-subdirectory layout (used by both mise and asdf).
-func scanVersionsDir(dir string) (string, bool) {
-	entries, err := os.ReadDir(dir)
+	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
+	defer cancel()
+	args := []string{"where", "elixir"}
+	if projectRoot != "" {
+		args = append(args, "-C", projectRoot)
+	}
+	out, err := exec.CommandContext(ctx, "mise", args...).Output()
 	if err != nil {
 		return "", false
 	}
-
-	var candidates []string
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		candidate := filepath.Join(dir, entry.Name(), "lib")
-		if dirHasElixirSources(candidate) {
-			candidates = append(candidates, candidate)
-		}
-	}
-	if len(candidates) == 0 {
+	installDir := strings.TrimSpace(string(out))
+	if installDir == "" {
 		return "", false
 	}
+	candidate := filepath.Join(installDir, "lib")
+	if dirHasElixirSources(candidate) {
+		return candidate, true
+	}
+	return "", false
+}
 
-	// Sort ascending and take the last entry to prefer the latest version.
-	sort.Strings(candidates)
-	return candidates[len(candidates)-1], true
+// deriveFromAsdf asks asdf for the active Elixir install path for the project.
+func deriveFromAsdf(projectRoot string) (string, bool) {
+	if _, err := exec.LookPath("asdf"); err != nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "asdf", "where", "elixir")
+	if projectRoot != "" {
+		cmd.Dir = projectRoot
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false
+	}
+	installDir := strings.TrimSpace(string(out))
+	if installDir == "" {
+		return "", false
+	}
+	candidate := filepath.Join(installDir, "lib")
+	if dirHasElixirSources(candidate) {
+		return candidate, true
+	}
+	return "", false
 }
 
 // deriveFromElixirExecutable resolves the elixir binary via PATH and derives

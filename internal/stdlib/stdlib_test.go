@@ -2,7 +2,9 @@ package stdlib
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -41,7 +43,7 @@ func TestResolve_ExplicitPathBypassesCache(t *testing.T) {
 	cache := &fakeCache{value: "/some/cached/path"}
 	explicit := t.TempDir()
 
-	root, ok := Resolve(cache, explicit)
+	root, ok := Resolve(cache, explicit, "")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -60,7 +62,7 @@ func TestResolve_EnvVarBypassesCache(t *testing.T) {
 
 	cache := &fakeCache{value: "/some/cached/path"}
 
-	root, ok := Resolve(cache, "")
+	root, ok := Resolve(cache, "", "")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -73,13 +75,14 @@ func TestResolve_EnvVarBypassesCache(t *testing.T) {
 	}
 }
 
-func TestResolve_ValidCacheSkipsDetection(t *testing.T) {
+func TestResolve_ValidCacheUsedWhenNoVersionManager(t *testing.T) {
 	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", "")
+	t.Setenv("PATH", t.TempDir()) // no mise/asdf/elixir in PATH
 
 	libDir := makeElixirLibDir(t)
 	cache := &fakeCache{value: libDir}
 
-	root, ok := Resolve(cache, "")
+	root, ok := Resolve(cache, "", "")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -88,15 +91,43 @@ func TestResolve_ValidCacheSkipsDetection(t *testing.T) {
 	}
 }
 
+func TestResolve_VersionManagerOverridesCache(t *testing.T) {
+	if _, err := exec.LookPath("mise"); err != nil {
+		t.Skip("mise not available in PATH")
+	}
+	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", "")
+
+	// Cache points to a fake dir that still has valid Elixir sources.
+	staleDir := makeElixirLibDir(t)
+	cache := &fakeCache{value: staleDir}
+
+	root, ok := Resolve(cache, "", "")
+	if !ok {
+		t.Skip("mise has no elixir version configured")
+	}
+	// The result should come from mise, not the stale cache.
+	if root == staleDir {
+		t.Error("expected version manager to override stale cache")
+	}
+	if !dirHasElixirSources(root) {
+		t.Errorf("version-manager result %q does not contain Elixir sources", root)
+	}
+	// Cache should be updated.
+	if cache.value != root {
+		t.Errorf("cache should be updated to %q, got %q", root, cache.value)
+	}
+}
+
 func TestResolve_StaleCacheTriggersRedetection(t *testing.T) {
 	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", "")
+	t.Setenv("PATH", t.TempDir())
 
 	// Point cache at a path that doesn't exist.
 	cache := &fakeCache{value: "/nonexistent/path/that/does/not/exist"}
 
 	// Detection will fail too (no real Elixir), but the important thing is
 	// the stale cache was not returned.
-	root, _ := Resolve(cache, "")
+	root, _ := Resolve(cache, "", "")
 	if root == "/nonexistent/path/that/does/not/exist" {
 		t.Error("should not return stale cached path")
 	}
@@ -105,28 +136,11 @@ func TestResolve_StaleCacheTriggersRedetection(t *testing.T) {
 func TestResolve_DetectedPathIsWrittenToCache(t *testing.T) {
 	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", "")
 
-	libDir := makeElixirLibDir(t)
 	cache := &fakeCache{}
 
-	// Manually inject the dir as if detection found it — test via scanVersionsDir.
-	// We can't easily invoke the full detect() chain without a real install, but
-	// we CAN verify Resolve calls SetStdlibRoot by making detection succeed via
-	// a mise-layout temp dir.
-	miseDir := t.TempDir()
-	versionDir := filepath.Join(miseDir, "installs", "elixir", "1.16.0")
-	if err := os.MkdirAll(filepath.Join(versionDir, "lib", "elixir", "lib"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	enumPath := filepath.Join(versionDir, "lib", "elixir", "lib", "enum.ex")
-	if err := os.WriteFile(enumPath, []byte("defmodule Enum do\nend\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("MISE_DATA_DIR", miseDir)
-	_ = libDir // unused in this variant
-
-	root, ok := Resolve(cache, "")
+	root, ok := Resolve(cache, "", "")
 	if !ok {
-		t.Skip("detection did not succeed (mise layout may not match)")
+		t.Skip("detection did not succeed (no Elixir install found)")
 	}
 	if cache.value == "" {
 		t.Error("expected cache to be populated after successful detection")
@@ -149,108 +163,38 @@ func TestDirHasElixirSources(t *testing.T) {
 	}
 }
 
-func TestScanVersionsDir_PicksLatest(t *testing.T) {
-	base := t.TempDir()
-
-	for _, version := range []string{"1.14.0", "1.15.0", "1.16.0"} {
-		enumPath := filepath.Join(base, version, "lib", "elixir", "lib", "enum.ex")
-		if err := os.MkdirAll(filepath.Dir(enumPath), 0755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(enumPath, []byte("defmodule Enum do\nend\n"), 0644); err != nil {
-			t.Fatal(err)
-		}
+func TestDeriveFromMise(t *testing.T) {
+	if _, err := exec.LookPath("mise"); err != nil {
+		t.Skip("mise not available in PATH")
 	}
-
-	root, ok := scanVersionsDir(base)
+	root, ok := deriveFromMise("")
 	if !ok {
-		t.Fatal("expected a result")
+		t.Skip("mise has no elixir version configured")
 	}
-	if filepath.Base(filepath.Dir(root)) != "1.16.0" {
-		t.Errorf("expected 1.16.0 to be selected, got dir %q", root)
+	if !dirHasElixirSources(root) {
+		t.Errorf("mise-derived path %q does not contain Elixir sources", root)
 	}
 }
 
-func TestScanVersionsDir_SkipsInvalidVersions(t *testing.T) {
-	base := t.TempDir()
-
-	// One valid, one missing enum.ex.
-	valid := filepath.Join(base, "1.16.0", "lib", "elixir", "lib", "enum.ex")
-	if err := os.MkdirAll(filepath.Dir(valid), 0755); err != nil {
+func TestDeriveFromMise_RespectsProjectRoot(t *testing.T) {
+	if _, err := exec.LookPath("mise"); err != nil {
+		t.Skip("mise not available in PATH")
+	}
+	// Use the current working directory as project root — should resolve to
+	// whatever version mise has active.
+	cwd, err := os.Getwd()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(valid, []byte("defmodule Enum do\nend\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(base, "1.17.0-rc.0", "lib"), 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	root, ok := scanVersionsDir(base)
+	root, ok := deriveFromMise(cwd)
 	if !ok {
-		t.Fatal("expected a result")
+		t.Skip("mise has no elixir version configured for cwd")
 	}
-	if filepath.Base(filepath.Dir(root)) != "1.16.0" {
-		t.Errorf("expected 1.16.0 to be selected, got dir %q", root)
+	if !dirHasElixirSources(root) {
+		t.Errorf("mise-derived path %q does not contain Elixir sources", root)
 	}
-}
-
-func TestScanVersionsDir_EmptyDir(t *testing.T) {
-	_, ok := scanVersionsDir(t.TempDir())
-	if ok {
-		t.Error("expected false for empty dir")
-	}
-}
-
-func TestScanVersionsDir_Nonexistent(t *testing.T) {
-	_, ok := scanVersionsDir("/nonexistent/mise/installs/elixir")
-	if ok {
-		t.Error("expected false for nonexistent dir")
-	}
-}
-
-func TestDeriveFromMise_UsesEnvVar(t *testing.T) {
-	miseDir := t.TempDir()
-	t.Setenv("MISE_DATA_DIR", miseDir)
-
-	versionDir := filepath.Join(miseDir, "installs", "elixir", "1.16.0")
-	enumPath := filepath.Join(versionDir, "lib", "elixir", "lib", "enum.ex")
-	if err := os.MkdirAll(filepath.Dir(enumPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(enumPath, []byte("defmodule Enum do\nend\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	root, ok := deriveFromMise()
-	if !ok {
-		t.Fatal("expected detection to succeed")
-	}
-	expected := filepath.Join(versionDir, "lib")
-	if root != expected {
-		t.Errorf("got %q, want %q", root, expected)
-	}
-}
-
-func TestDeriveFromAsdf_UsesEnvVar(t *testing.T) {
-	asdfDir := t.TempDir()
-	t.Setenv("ASDF_DATA_DIR", asdfDir)
-
-	versionDir := filepath.Join(asdfDir, "installs", "elixir", "1.16.0")
-	enumPath := filepath.Join(versionDir, "lib", "elixir", "lib", "enum.ex")
-	if err := os.MkdirAll(filepath.Dir(enumPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(enumPath, []byte("defmodule Enum do\nend\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	root, ok := deriveFromAsdf()
-	if !ok {
-		t.Fatal("expected detection to succeed")
-	}
-	expected := filepath.Join(versionDir, "lib")
-	if root != expected {
-		t.Errorf("got %q, want %q", root, expected)
+	// The path should contain the mise installs directory.
+	if !strings.Contains(root, "mise") {
+		t.Errorf("expected mise install path, got %q", root)
 	}
 }

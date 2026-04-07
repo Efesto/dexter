@@ -183,7 +183,8 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stderr = os.Stderr
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start formatter: %w", err)
@@ -234,6 +235,8 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 			if r.err != nil {
 				fp.startErr = fmt.Errorf("formatter ready: %w", r.err)
 				_ = cmd.Process.Kill()
+				<-done // wait for cmd.Wait() to finish copying stderr
+				s.notifyOTPMismatch(stderrBuf.String())
 			} else if r.status != 0 {
 				fp.startErr = fmt.Errorf("formatter failed to initialize (status %d)", r.status)
 				_ = cmd.Process.Kill()
@@ -393,6 +396,7 @@ func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, path, content
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		log.Printf("Formatting: mix format failed for %s (%s): %v\n%s", path, time.Since(start), err, stderr.String())
+		s.notifyOTPMismatch(stderr.String())
 		return "", err
 	}
 	log.Printf("Formatting: %s (%s, mix format)", path, time.Since(start))

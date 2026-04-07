@@ -28,6 +28,7 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	}
 
 	server := NewServer(s, dir)
+	server.snippetSupport = true
 
 	// Resolve the mix binary so formatting tests work
 	if p, err := exec.LookPath("mix"); err == nil {
@@ -415,25 +416,83 @@ end
 
 	items := completionAt(t, server, uri, 0, 17)
 
+	var foundCreate, foundAll bool
 	for _, item := range items {
-		if item.Label == "create" {
-			if item.InsertText != "create(${1:arg1}, ${2:arg2})" {
-				t.Errorf("create: expected snippet insert text, got %q", item.InsertText)
+		if item.Label == "create/2" {
+			foundCreate = true
+			if item.InsertText != "create(${1:name}, ${2:email})$0" {
+				t.Errorf("create/2: expected snippet insert text, got %q", item.InsertText)
 			}
 			if item.InsertTextFormat != protocol.InsertTextFormatSnippet {
-				t.Errorf("create: expected snippet format, got %v", item.InsertTextFormat)
+				t.Errorf("create/2: expected snippet format, got %v", item.InsertTextFormat)
+			}
+		}
+		if item.Label == "all/0" {
+			foundAll = true
+			if item.InsertText != "all()" {
+				t.Errorf("all/0: expected plain call for zero-arity, got %q", item.InsertText)
+			}
+			if item.InsertTextFormat == protocol.InsertTextFormatSnippet {
+				t.Error("all/0: should not have snippet format for zero-arity")
+			}
+		}
+	}
+	if !foundCreate {
+		t.Error("expected to find completion item create/2")
+	}
+	if !foundAll {
+		t.Error("expected to find completion item all/0")
+	}
+}
+
+func TestCompletion_PipeSnippet(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def transform(data, format, opts) do
+    :ok
+  end
+
+  def validate(data) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+
+	// Pipe context: first arg should be omitted from snippet
+	server.docs.Set(uri, "  |> MyApp.Accounts.trans")
+	items := completionAt(t, server, uri, 0, 25)
+	for _, item := range items {
+		if item.Label == "transform/3" {
+			if item.InsertText != "transform(${1:format}, ${2:opts})$0" {
+				t.Errorf("pipe transform/3: expected pipe snippet, got %q", item.InsertText)
 			}
 			break
 		}
 	}
 
+	// Single-arity in pipe: should become zero-arg call
+	server.docs.Set(uri, "  |> MyApp.Accounts.vali")
+	items = completionAt(t, server, uri, 0, 24)
 	for _, item := range items {
-		if item.Label == "all" {
-			if item.InsertText != "" {
-				t.Errorf("all: expected no insert text for zero-arity, got %q", item.InsertText)
+		if item.Label == "validate/1" {
+			if item.InsertText != "validate()" {
+				t.Errorf("pipe validate/1: expected empty parens, got %q", item.InsertText)
 			}
-			if item.InsertTextFormat == protocol.InsertTextFormatSnippet {
-				t.Error("all: should not have snippet format for zero-arity")
+			break
+		}
+	}
+
+	// Non-pipe context: all args should be present
+	server.docs.Set(uri, "  MyApp.Accounts.trans")
+	items = completionAt(t, server, uri, 0, 21)
+	for _, item := range items {
+		if item.Label == "transform/3" {
+			if item.InsertText != "transform(${1:data}, ${2:format}, ${3:opts})$0" {
+				t.Errorf("non-pipe transform/3: expected full snippet, got %q", item.InsertText)
 			}
 			break
 		}
@@ -2392,7 +2451,7 @@ func TestServer_Formatting_AlreadyFormatted(t *testing.T) {
 }
 
 func TestDetectElixirStdlibRoot(t *testing.T) {
-	root, ok := stdlib.DetectElixirLibRoot()
+	root, ok := stdlib.DetectElixirLibRoot("")
 	if !ok {
 		t.Skip("elixir not available in PATH")
 	}

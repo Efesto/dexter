@@ -1313,6 +1313,44 @@ func TestCountDefaultParams(t *testing.T) {
 	}
 }
 
+func TestExtractParamNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		funcName string
+		expected []string
+	}{
+		{"simple params", "  def create(name, email) do", "create", []string{"name", "email"}},
+		{"default param", `  def fetch(slug, opts \\ []) do`, "fetch", []string{"slug", "opts"}},
+		{"pattern match map", "  def process(%{name: name}, data) do", "process", []string{"arg1", "data"}},
+		{"no params", "  def run do", "run", nil},
+		{"empty parens", "  def run() do", "run", nil},
+		{"single param", "  def get(id) do", "get", []string{"id"}},
+		{"underscore param", "  def handle(_ignored, state) do", "handle", []string{"_ignored", "state"}},
+		{"struct = var", "  def update(%User{} = user, attrs) do", "update", []string{"user", "attrs"}},
+		{"var = struct", "  def update(user = %User{}, attrs) do", "update", []string{"user", "attrs"}},
+		{"tuple pattern", "  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do", "handle_info", []string{"arg1", "state"}},
+		{"bare underscore", "  def foo(_, b) do", "foo", []string{"arg1", "b"}},
+		{"atom literal", "  def handle_call(:get, _from, state) do", "handle_call", []string{"arg1", "_from", "state"}},
+		{"list pattern = var", "  def process([_ | _] = list, opts) do", "process", []string{"list", "opts"}},
+		{"binary pattern", "  def parse(<<header::16, rest::binary>>) do", "parse", []string{"arg1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractParamNames(tt.line, tt.funcName)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("ExtractParamNames(%q, %q) = %v, want %v", tt.line, tt.funcName, got, tt.expected)
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("param %d: got %q, want %q", i, got[i], tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
 func TestParseFile_DefaultParamExpansion(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Companies do
   def fetch_company_by_slug(slug, opts \\ []) do
@@ -1336,20 +1374,24 @@ end
 
 	// Collect all (function, arity) pairs
 	type funcArity struct {
-		name  string
-		arity int
+		name   string
+		arity  int
+		params string
 	}
 	var funcArities []funcArity
 	for _, d := range defs {
 		if d.Function != "" {
-			funcArities = append(funcArities, funcArity{d.Function, d.Arity})
+			funcArities = append(funcArities, funcArity{d.Function, d.Arity, d.Params})
 		}
 	}
 
 	// fetch_company_by_slug should have arity 1 and 2
 	found := map[string]bool{}
+	paramsByKey := map[string]string{}
 	for _, fa := range funcArities {
-		found[fa.name+"/"+fmt.Sprintf("%d", fa.arity)] = true
+		key := fa.name + "/" + fmt.Sprintf("%d", fa.arity)
+		found[key] = true
+		paramsByKey[key] = fa.params
 	}
 
 	for _, expected := range []string{
@@ -1368,6 +1410,20 @@ end
 	// no_defaults should NOT have arity 1
 	if found["no_defaults/1"] {
 		t.Errorf("no_defaults/1 should not exist")
+	}
+
+	// Check params are correctly extracted
+	if params := paramsByKey["fetch_company_by_slug/1"]; params != "slug" {
+		t.Errorf("fetch_company_by_slug/1 params: got %q, want %q", params, "slug")
+	}
+	if params := paramsByKey["fetch_company_by_slug/2"]; params != "slug,opts" {
+		t.Errorf("fetch_company_by_slug/2 params: got %q, want %q", params, "slug,opts")
+	}
+	if params := paramsByKey["multi_default/1"]; params != "a" {
+		t.Errorf("multi_default/1 params: got %q, want %q", params, "a")
+	}
+	if params := paramsByKey["multi_default/3"]; params != "a,b,c" {
+		t.Errorf("multi_default/3 params: got %q, want %q", params, "a,b,c")
 	}
 }
 

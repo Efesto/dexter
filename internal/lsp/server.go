@@ -78,7 +78,7 @@ type Server struct {
 	reindexing          sync.Mutex // serializes concurrent backgroundReindex calls
 	notifiedOTPMismatch sync.Once  // prevents repeated OTP mismatch warnings
 
-	backgroundWork sync.WaitGroup // tracks in-flight background goroutines for graceful shutdown
+	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {

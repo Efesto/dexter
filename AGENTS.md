@@ -12,7 +12,7 @@ make lint   # run after completing a set of changes
 
 Install `golangci-lint` if needed:
 ```sh
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.9.0
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
 ```
 
 ## Conventions

@@ -134,7 +134,9 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 // backgroundReindex runs in the background. If the index is empty it does a
 // full init, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
+	s.backgroundWork.Add(1)
 	go func() {
+		defer s.backgroundWork.Done()
 		if !s.reindexing.TryLock() {
 			return
 		}

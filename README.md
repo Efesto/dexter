@@ -90,7 +90,7 @@ Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 
 
 ## Quick start
 
-### Install via mise (recommended)
+### Install via mise or asdf
 
 ```sh
 # 1. Install dependencies (if you don't already have them)
@@ -98,6 +98,8 @@ brew install sqlite  # or your preferred package manager
 
 # 2. Install dexter (builds from source if no prebuilt binary is available for your platform)
 mise plugin add dexter https://github.com/remoteoss/dexter.git && mise use -g dexter@latest
+# or, with asdf:
+# asdf plugin add dexter https://github.com/remoteoss/dexter.git && asdf install dexter latest && asdf global dexter latest
 
 # 3. Add .dexter.db to your .gitignore
 echo ".dexter.db*" >> .gitignore

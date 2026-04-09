@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.3] - 2026-04-09
+
+### Added
+
+- **Open-source release** — Dexter is now available under the MIT license on GitHub, with updated install scripts for mise and asdf
+
+### Fixed
+
+- **Aliases injected via `use`** — `use` macros that inject `alias` declarations (e.g. `alias MyApp.Repo` inside `__using__`) now propagate those aliases to the consumer module, so go-to-definition, hover, completions, references, rename, signature help, and all other LSP features correctly resolve the aliased modules; also follows transitive `use` chains and helper `quote do` blocks
+- **Module depth tracking** — module nesting depth is now tracked by counting `do..end` and `fn..end` blocks instead of relying on indentation, fixing incorrect module scope attribution when anonymous functions or other nested blocks were present; heredoc content and string literals are now properly excluded from block detection
+- **Formatter `_build` lookup in umbrella apps** — the persistent formatter process now walks up from the app's mix root to the umbrella root to find `_build` and `deps`, so formatter plugins and `import_deps` resolve correctly in umbrella projects
+- **Folding ranges** — folding range detection now strips strings and comments before checking for block boundaries, preventing false ranges from string content like `"foo do"`
+
 ## [0.5.2] - 2026-04-07
 
 ### Added

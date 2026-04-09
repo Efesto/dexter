@@ -382,10 +382,47 @@ func ExtractImports(text string) []string {
 	return imports
 }
 
+// extractAliasFromLine checks whether line matches an alias declaration
+// (alias X, as: Y / alias X.{A, B} / alias X.Y) and, if so, records it in
+// aliases and returns the (possibly newly-created) map plus true. Returns
+// (aliases, false) when the line is not an alias declaration.
+func extractAliasFromLine(line string, aliases map[string]string, resolveAlias func(string) string) (map[string]string, bool) {
+	if m := parser.AliasAsRe.FindStringSubmatch(line); m != nil {
+		if aliases == nil {
+			aliases = make(map[string]string)
+		}
+		aliases[m[2]] = resolveAlias(m[1])
+		return aliases, true
+	}
+	if m := aliasMultiRe.FindStringSubmatch(line); m != nil {
+		base := resolveAlias(m[1])
+		for _, name := range strings.Split(m[2], ",") {
+			name = strings.TrimSpace(name)
+			if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
+				if aliases == nil {
+					aliases = make(map[string]string)
+				}
+				aliases[name] = base + "." + name
+			}
+		}
+		return aliases, true
+	}
+	if m := parser.AliasRe.FindStringSubmatch(line); m != nil {
+		resolved := resolveAlias(m[1])
+		parts := strings.Split(resolved, ".")
+		if aliases == nil {
+			aliases = make(map[string]string)
+		}
+		aliases[parts[len(parts)-1]] = resolved
+		return aliases, true
+	}
+	return aliases, false
+}
+
 // parseHelperQuoteBlock finds `def/defp helperName` in lines, locates its
-// `quote do` block, and extracts imports/uses/inline-defs from it. Returns
-// nil slices if the function or its quote block can't be found.
-func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding) {
+// `quote do` block, and extracts imports/uses/inline-defs/aliases from it.
+// Returns nil slices if the function or its quote block can't be found.
+func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
 	resolveAlias := func(modName string) string {
 		return parser.ResolveModuleRef(modName, fileAliases, "")
 	}
@@ -453,6 +490,10 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		}
 		if m := useRe.FindStringSubmatch(line); m != nil {
 			transUses = append(transUses, resolveAlias(m[1]))
+			continue
+		}
+		if updated, matched := extractAliasFromLine(line, aliases, resolveAlias); matched {
+			aliases = updated
 			continue
 		}
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
@@ -528,10 +569,11 @@ type inlineDef struct {
 }
 
 // parseUsingBody finds the defmacro __using__ block in text and scans its body
-// for import statements, inline function definitions, transitive use calls, and
+// for import statements, inline function definitions, transitive use calls,
 // dynamic opt-driven imports (e.g. `import unquote(mod)` where `mod` comes from
-// a Keyword.get on opts).
-func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding) {
+// a Keyword.get on opts), and alias declarations that get injected into the
+// consumer module.
+func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
 	lines := strings.Split(text, "\n")
 	fileAliases := extractAliasesFromLines(lines, -1)
 
@@ -664,18 +706,30 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			continue
 		}
 
+		if updated, matched := extractAliasFromLine(line, aliases, resolveAlias); matched {
+			aliases = updated
+			continue
+		}
+
 		// Delegation to a helper function: `using_block(opts)` or similar.
 		// Find that function's definition in the same file and parse its
 		// quote do block, which contains the actual imports/uses to inject.
 		if m := bareCallRe.FindStringSubmatch(line); m != nil {
 			helperName := m[1]
-			if helperImported, helperDefs, helperTransUses, helperBindings := parseHelperQuoteBlock(lines, helperName, fileAliases); helperImported != nil {
+			helperImported, helperDefs, helperTransUses, helperBindings, helperAliases := parseHelperQuoteBlock(lines, helperName, fileAliases)
+			if helperImported != nil {
 				imported = append(imported, helperImported...)
 				for k, v := range helperDefs {
 					inlineDefs[k] = append(inlineDefs[k], v...)
 				}
 				transUses = append(transUses, helperTransUses...)
 				optBindings = append(optBindings, helperBindings...)
+			}
+			for k, v := range helperAliases {
+				if aliases == nil {
+					aliases = make(map[string]string)
+				}
+				aliases[k] = v
 			}
 			continue
 		}

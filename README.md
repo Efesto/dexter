@@ -16,6 +16,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
   - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
   - [Zed](#zed)
   - [Emacs](#emacs)
+  - [Helix](#helix)
 - [Why build another LSP?](#why-build-another-lsp)
 - [Performance](#performance)
 - [CLI usage](#cli-usage)
@@ -284,6 +285,20 @@ The emacs instructions assume you're using **use-package**.
                      '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
     :activation-fn (lsp-activate-on "elixir")
     :server-id 'dexter-elixir)))
+```
+
+### Helix
+
+Add to your LSP configuration in `~/.config/helix/languages.toml`:
+
+```toml
+[language-server.dexter]
+command = "dexter"
+args = ["lsp"]
+
+[[language]]
+name = "elixir"
+language-servers = ["dexter"]
 ```
 
 ## Why build another LSP?

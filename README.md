@@ -37,7 +37,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
   - [Variables](#variables)
 - [Lightning-fast formatting](#lightning-fast-formatting)
 - [LSP options](#lsp-options)
-- [Index database location (.dexter.db)](#index-database-location-dexterdb)
+- [Index database location (.dexter/)](#index-database-location-dexter)
 - [Debugging](#debugging)
 - [Development (building from source)](#development-building-from-source)
 - [Releasing](#releasing)
@@ -92,10 +92,7 @@ mise plugin add dexter https://github.com/remoteoss/dexter.git && mise use -g de
 # or, with asdf:
 # asdf plugin add dexter https://github.com/remoteoss/dexter.git && asdf install dexter latest && asdf global dexter latest
 
-# 3. Add .dexter.db to your .gitignore
-echo ".dexter.db*" >> .gitignore
-
-# 4. Configure your editor (see below)
+# 3. Configure your editor (see below)
 # The LSP server auto-builds the index on first startup — no need to run dexter init manually.
 # You can still run it explicitly if you prefer: dexter init ~/code/my-elixir-project
 ```
@@ -150,7 +147,7 @@ Add to your LSP configuration (e.g., `after/plugin/lsp.lua`):
 ```lua
 vim.lsp.config('dexter', {
   cmd = { 'dexter', 'lsp' },
-  root_markers = { '.dexter.db', '.git', 'mix.exs' },
+  root_markers = { '.dexter/dexter.db', '.dexter.db', '.git', 'mix.exs' },
   filetypes = { 'elixir', 'eelixir', 'heex' },
   init_options = {
     followDelegates = true,  -- jump through defdelegate to the target function
@@ -210,7 +207,7 @@ configs.dexter = {
   default_config = {
     cmd = { "dexter", "lsp" }, -- update this if you don't have Dexter in your PATH
     filetypes = { "elixir", "eelixir", "heex" },
-    root_dir = lspconfig.util.root_pattern(".dexter.db", "mix.exs", ".git"),
+    root_dir = lspconfig.util.root_pattern(".dexter/dexter.db", ".dexter.db", "mix.exs", ".git"),
   },
 }
 
@@ -515,11 +512,15 @@ Dexter reads `initializationOptions` from your editor configuration:
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 - **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 
-## Index database location (.dexter.db)
+## Index database location (.dexter/)
 
-Dexter creates `.dexter.db` at the root of your project when you start the LSP for the first time. But if you prefer, you can run `dexter init` yourself in the root of your project. Where you place it determines what gets indexed.
+Dexter creates `.dexter/dexter.db` at the root of your project when you start the LSP for the first time. But if you prefer, you can run `dexter init` yourself in the root of your project. Where you place it determines what gets indexed.
 
-When the LSP server starts, it walks up from the project root looking for `.dexter.db`, preferring `.git` as the anchor point. This means if you initialised from the monorepo root, the server will find the right database even when Neovim's `rootUri` points to a sub-app (e.g. because `mix.exs` is there).
+The `.dexter/` folder includes its own `.gitignore` (containing `*`), so its contents are automatically ignored by git — no need to update your project's `.gitignore`.
+
+When the LSP server starts, it walks up from the project root looking for `.dexter/dexter.db`, preferring `.git` as the anchor point. This means if you initialised from the monorepo root, the server will find the right database even when Neovim's `rootUri` points to a sub-app (e.g. because `mix.exs` is there).
+
+If you're upgrading from a pre-`.dexter/` version of dexter, any existing `.dexter.db` file at your project root will be automatically deleted and rebuilt into the new `.dexter/` folder on the next `dexter init` or LSP startup. You can also remove any `.dexter.db*` or `.dexter/` entries from your `.gitignore`, as they are no longer needed.
 
 **Monorepo root (recommended if using an Elixir monorepo or umbrella structure)** — Put the index at the root of your repository, next to `.git`. This indexes everything: all apps, all shared libraries, and all deps. Go-to-definition works across the entire codebase.
 

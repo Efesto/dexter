@@ -16,8 +16,73 @@ type Store struct {
 	db *sql.DB
 }
 
+// DBPath returns the canonical database path for a project root:
+// <root>/.dexter/dexter.db
+func DBPath(projectRoot string) string {
+	return filepath.Join(projectRoot, ".dexter", "dexter.db")
+}
+
+// DBDir returns the directory that holds the database: <root>/.dexter
+func DBDir(projectRoot string) string {
+	return filepath.Join(projectRoot, ".dexter")
+}
+
+// LegacyDBPath returns the pre-migration database path: <root>/.dexter.db
+// Used only for detecting and deleting databases created before the
+// .dexter/ folder layout.
+func LegacyDBPath(projectRoot string) string {
+	return filepath.Join(projectRoot, ".dexter.db")
+}
+
+// FindProjectRoot walks up from path looking for known dexter/project
+// markers. The default markers (in priority order) are:
+//
+//  1. .dexter/dexter.db — the current database layout
+//  2. .dexter.db         — the legacy layout (pre-.dexter/ folder)
+//  3. .git               — repository root fallback
+//
+// Additional markers can be passed via extraMarkers; they are tried after
+// the defaults, in the order given. The CLI passes "mix.exs" to fall back
+// to the nearest Mix project when no dexter/git marker is found.
+//
+// Returns the original path if no marker is found.
+func FindProjectRoot(path string, extraMarkers ...string) string {
+	markers := append([]string{
+		filepath.Join(".dexter", "dexter.db"),
+		".dexter.db",
+		".git",
+	}, extraMarkers...)
+
+	for _, marker := range markers {
+		dir := path
+		for {
+			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+				return dir
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return path
+}
+
 func Open(projectRoot string) (*Store, error) {
-	dbPath := filepath.Join(projectRoot, ".dexter.db")
+	if err := migrateLegacyLayout(projectRoot); err != nil {
+		return nil, fmt.Errorf("migrate legacy layout: %w", err)
+	}
+	dexterDir := DBDir(projectRoot)
+	if err := os.MkdirAll(dexterDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create dexter dir: %w", err)
+	}
+	gitignorePath := filepath.Join(dexterDir, ".gitignore")
+	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
+		_ = os.WriteFile(gitignorePath, []byte("*\n"), 0o644)
+	}
+
+	dbPath := DBPath(projectRoot)
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return nil, err
@@ -30,6 +95,28 @@ func Open(projectRoot string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+// migrateLegacyLayout deletes any pre-.dexter/ folder artifacts so that a
+// fresh database will be built at the new location on the next Open. The
+// index is a derived cache, so deletion (rather than move) is safe and
+// avoids WAL/SHM consistency edge cases.
+//
+// Returns nil when there is nothing to migrate.
+func migrateLegacyLayout(projectRoot string) error {
+	legacy := LegacyDBPath(projectRoot)
+	if _, err := os.Stat(legacy); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat legacy db %s: %w", legacy, err)
+	}
+	for _, f := range []string{legacy, legacy + "-shm", legacy + "-wal"} {
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", f, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {

@@ -3,10 +3,35 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/remoteoss/dexter/internal/parser"
 )
+
+func TestDBPath(t *testing.T) {
+	got := DBPath("/project/root")
+	want := filepath.Join("/project/root", ".dexter", "dexter.db")
+	if got != want {
+		t.Errorf("DBPath = %q, want %q", got, want)
+	}
+}
+
+func TestDBDir(t *testing.T) {
+	got := DBDir("/project/root")
+	want := filepath.Join("/project/root", ".dexter")
+	if got != want {
+		t.Errorf("DBDir = %q, want %q", got, want)
+	}
+}
+
+func TestLegacyDBPath(t *testing.T) {
+	got := LegacyDBPath("/project/root")
+	want := filepath.Join("/project/root", ".dexter.db")
+	if got != want {
+		t.Errorf("LegacyDBPath = %q, want %q", got, want)
+	}
+}
 
 func setupTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
@@ -955,15 +980,98 @@ func TestStdlibRoot(t *testing.T) {
 
 func TestOpenCorruptedDB(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, ".dexter.db")
 
-	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database"), 0644); err != nil {
+	// Pre-create the .dexter/ folder and plant a garbage DB file in the
+	// new location so Open's migration path doesn't touch it.
+	if err := os.MkdirAll(DBDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := DBPath(dir)
+
+	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	_, err := Open(dir)
 	if err == nil {
 		t.Fatal("expected Open to fail on a corrupted DB file, got nil")
+	}
+}
+
+func TestOpen_CreatesDexterFolder(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if info, err := os.Stat(filepath.Join(dir, ".dexter")); err != nil || !info.IsDir() {
+		t.Errorf(".dexter/ directory was not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".dexter", "dexter.db")); err != nil {
+		t.Errorf(".dexter/dexter.db was not created: %v", err)
+	}
+	gitignore := filepath.Join(dir, ".dexter", ".gitignore")
+	content, err := os.ReadFile(gitignore)
+	if err != nil {
+		t.Errorf(".dexter/.gitignore was not created: %v", err)
+	} else if string(content) != "*\n" {
+		t.Errorf(".dexter/.gitignore content = %q, want %q", string(content), "*\n")
+	}
+}
+
+func TestOpen_MigratesLegacyLayout(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed a fake legacy database and its WAL siblings.
+	legacy := filepath.Join(dir, ".dexter.db")
+	legacyShm := legacy + "-shm"
+	legacyWal := legacy + "-wal"
+	for _, f := range []string{legacy, legacyShm, legacyWal} {
+		if err := os.WriteFile(f, []byte("legacy placeholder"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	for _, f := range []string{legacy, legacyShm, legacyWal} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("legacy file %s still exists (err=%v)", f, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".dexter", "dexter.db")); err != nil {
+		t.Errorf("new DB was not created: %v", err)
+	}
+
+	// Smoke test: the store should be functional after migration.
+	if _, err := s.db.Exec("INSERT INTO files (path, mtime) VALUES (?, ?)", "/fake.ex", 1); err != nil {
+		t.Errorf("store not functional after migration: %v", err)
+	}
+}
+
+func TestOpen_MigrationWithPartialLegacyFiles(t *testing.T) {
+	// Legacy DB present but no WAL siblings — should still migrate cleanly.
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, ".dexter.db")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Errorf("legacy .dexter.db still exists: %v", err)
 	}
 }
 
@@ -1124,4 +1232,84 @@ end
 	if results[0].Module != "MyApp.Users" {
 		t.Errorf("expected case-sensitive match MyApp.Users first, got %s.%s", results[0].Module, results[0].Function)
 	}
+}
+
+func TestFindProjectRoot(t *testing.T) {
+	// Helper: create a directory tree inside t.TempDir() and return the root.
+	mktree := func(t *testing.T, files []string) string {
+		t.Helper()
+		root := t.TempDir()
+		for _, rel := range files {
+			full := filepath.Join(root, rel)
+			if strings.HasSuffix(rel, "/") {
+				if err := os.MkdirAll(full, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte(""), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+
+	t.Run("new layout at root", func(t *testing.T) {
+		root := mktree(t, []string{".dexter/dexter.db", "apps/app/lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("legacy file at root", func(t *testing.T) {
+		root := mktree(t, []string{".dexter.db", "apps/app/lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("git fallback", func(t *testing.T) {
+		root := mktree(t, []string{".git/", "apps/app/lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("mix.exs extra marker", func(t *testing.T) {
+		root := mktree(t, []string{"apps/app/mix.exs", "apps/app/lib/foo.ex"})
+		start := filepath.Join(root, "apps", "app", "lib")
+		got := FindProjectRoot(start, "mix.exs")
+		want := filepath.Join(root, "apps", "app")
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("no marker returns input", func(t *testing.T) {
+		root := mktree(t, []string{"lib/foo.ex"})
+		start := filepath.Join(root, "lib")
+		got := FindProjectRoot(start)
+		if got != start {
+			t.Errorf("got %q, want %q", got, start)
+		}
+	})
+
+	t.Run("new layout preferred over legacy", func(t *testing.T) {
+		// New layout at the repo root, legacy file inside a nested subdir.
+		// Walking up from the subdir must return the repo root (matching
+		// .dexter/dexter.db first), not the subdir — a reversed priority
+		// would incorrectly match the closer .dexter.db.
+		root := mktree(t, []string{".dexter/dexter.db", "apps/app/.dexter.db"})
+		cwd := filepath.Join(root, "apps", "app")
+		got := FindProjectRoot(cwd)
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
 }

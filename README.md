@@ -8,7 +8,6 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 - [Features](#features)
 - [Quick start](#quick-start)
-  - [Install via mise or asdf](#install-via-mise-or-asdf)
 - [Editor setup](#editor-setup)
   - [VS Code / Cursor](#vs-code--cursor)
     - [Configuration](#configuration)
@@ -81,23 +80,29 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 ## Quick start
 
-### Install via mise or asdf
+1. **Install SQLite** (required dependency):
 
-```sh
-# 1. Install dependencies (if you don't already have them)
-brew install sqlite  # or your preferred package manager
+   ```sh
+   brew install sqlite            # macOS
+   sudo apt install sqlite3       # Debian/Ubuntu
+   sudo pacman -S sqlite          # Arch
+   ```
 
-# 2. Install dexter (builds from source if no prebuilt binary is available for your platform)
-mise plugin add dexter https://github.com/remoteoss/dexter.git && mise use -g dexter@latest
-# or, with asdf:
-# asdf plugin add dexter https://github.com/remoteoss/dexter.git && asdf install dexter latest && asdf global dexter latest
+2. **Install Dexter.** Pick one:
 
-# 3. Configure your editor (see below)
-# The LSP server auto-builds the index on first startup — no need to run dexter init manually.
-# You can still run it explicitly if you prefer: dexter init ~/code/my-elixir-project
-```
+   ```sh
+   # via mise
+   mise plugin add dexter https://github.com/remoteoss/dexter.git && mise use -g dexter@latest
 
-You can also [build from source](#development-building-from-source) directly.
+   # via asdf
+   asdf plugin add dexter https://github.com/remoteoss/dexter.git && asdf install dexter latest && asdf set --home dexter latest
+   ```
+
+   Or [build from source](#development-building-from-source).
+
+3. **Configure your editor** — see [Editor setup](#editor-setup) below.
+
+4. **Open an Elixir project.** Dexter indexes automatically the first time the LSP starts.
 
 ## Editor setup
 

@@ -96,6 +96,9 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
    # via asdf
    asdf plugin add dexter https://github.com/remoteoss/dexter.git && asdf install dexter latest && asdf set --home dexter latest
+   
+   # via Homebrew
+   brew install remoteoss/tap/dexter
    ```
 
    Or [build from source](#development-building-from-source).

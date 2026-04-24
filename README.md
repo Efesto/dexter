@@ -80,15 +80,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 ## Quick start
 
-1. **Install SQLite** (required dependency):
-
-   ```sh
-   brew install sqlite            # macOS
-   sudo apt install sqlite3       # Debian/Ubuntu
-   sudo pacman -S sqlite          # Arch
-   ```
-
-2. **Install Dexter.** Pick one:
+1. **Install Dexter.** Pick one:
 
    ```sh
    # via mise
@@ -103,9 +95,9 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
    Or [build from source](#development-building-from-source).
 
-3. **Configure your editor** — see [Editor setup](#editor-setup) below.
+2. **Configure your editor** — see [Editor setup](#editor-setup) below.
 
-4. **Open an Elixir project.** Dexter indexes automatically the first time the LSP starts.
+3. **Open an Elixir project.** Dexter indexes automatically the first time the LSP starts.
 
 ## Editor setup
 
